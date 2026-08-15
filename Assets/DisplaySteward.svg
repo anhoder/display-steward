@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="64" y="64" width="896" height="896" rx="220" fill="#2457D6"/>
+  <path d="M512 64H740A220 220 0 0 1 960 284V740A220 220 0 0 1 740 960H512Z" fill="#1495B8"/>
+  <rect x="166" y="142" width="430" height="24" rx="12" fill="#60A5FA"/>
+
+  <rect x="174" y="280" width="486" height="350" rx="68" fill="#F8FAFC"/>
+  <rect x="212" y="318" width="410" height="250" rx="38" fill="#11324A"/>
+  <rect x="390" y="616" width="54" height="94" rx="20" fill="#F8FAFC"/>
+  <rect x="304" y="688" width="226" height="44" rx="22" fill="#F8FAFC"/>
+
+  <rect x="538" y="390" width="310" height="222" rx="50" fill="#F8FAFC"/>
+  <rect x="572" y="424" width="242" height="150" rx="26" fill="#A5F3FC"/>
+  <rect x="670" y="598" width="46" height="79" rx="18" fill="#F8FAFC"/>
+  <rect x="596" y="658" width="194" height="38" rx="19" fill="#F8FAFC"/>
+
+  <circle cx="764" cy="284" r="120" fill="#CCFBF1"/>
+  <circle cx="764" cy="284" r="94" fill="#14B8A6"/>
+  <polygon points="696,278 722,252 748,278 806,220 834,248 748,334" fill="#F0FDFA"/>
+
+  <rect x="248" y="354" width="208" height="20" rx="10" fill="#38BDF8"/>
+  <rect x="248" y="398" width="156" height="20" rx="10" fill="#22D3EE"/>
+</svg>

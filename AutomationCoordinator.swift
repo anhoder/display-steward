@@ -50,7 +50,7 @@ enum RuntimeDiagnosticSeverity: String, Equatable {
     case error
 }
 
-enum RuntimeDiagnosticCode: String, Equatable {
+enum RuntimeDiagnosticCode: String, Equatable, Hashable {
     case configurationFallback
     case configurationUnavailable
     case runtimeStateUnavailable
@@ -75,6 +75,44 @@ struct ConfigurationPreview: Equatable {
     var evaluation: RuleEvaluationPlan
     var cycleAnalysis: CycleAnalysis
 }
+struct ProfileActivationPreview: Equatable {
+    var profile: DisplayProfile
+    var evaluation: RuleEvaluationPlan
+    var cycleAnalysis: CycleAnalysis
+    var profileSource: PersistenceGenerationSource
+    var primaryErrorDescription: String?
+    var policyFingerprint: DisplayPolicySnapshotFingerprint
+}
+
+enum ProfileHardwareApplicationOutcome: String, Equatable {
+    case notNeeded
+    case applied
+    case partiallyFailed
+    case failed
+    case blockedBySafety
+}
+
+struct ProfileActivationResult: Equatable {
+    var activeProfile: DisplayProfile
+    var preview: ProfileActivationPreview
+    var hardwareOutcome: ProfileHardwareApplicationOutcome
+    var actionDiagnostics: [RuntimeDiagnostic]
+}
+
+private struct HardwareApplicationReport {
+    var outcome: ProfileHardwareApplicationOutcome
+    var diagnostics: [RuntimeDiagnostic]
+}
+private struct ConfirmedActionIntent: Hashable {
+    var display: EvaluatedDisplayKey
+    var action: DisplayAction
+}
+private struct ConfirmedProfileGeneration {
+    var profile: DisplayProfile
+    var source: PersistenceGenerationSource
+}
+
+
 
 enum DisplayRecoveryEvidenceKind: String, Equatable {
     case disabledByApplication
@@ -132,6 +170,18 @@ struct AutomationRuntimeStatus: Equatable {
     var configurationLoadSource: ConfigurationLoadSource?
     var recoveryPlan: DisplayRecoveryPlan = .empty
     var lastRecoveryResult: DisplayRecoveryBatchResult? = nil
+    var activeProfile: DisplayProfile? = nil
+    var profileCatalog: DisplayProfileCatalog = DisplayProfileCatalog(profiles: [], invalidProfiles: [])
+    var settingsGenerationSource: PersistenceGenerationSource? = nil
+    var activeProfileGenerationSource: PersistenceGenerationSource? = nil
+    var persistenceErrorDescription: String? = nil
+    var lastProfileActivation: ProfileActivationResult? = nil
+    var externalApplicationSettings: ApplicationSettings? = nil
+    var externalSettingsGenerationSource: PersistenceGenerationSource? = nil
+    var externalSettingsErrorDescription: String? = nil
+    var externalActiveProfileID: UUID? = nil
+
+    var isCatalogValid: Bool { profileCatalog.invalidProfiles.isEmpty }
 
     var isPaused: Bool { pauseReason != nil }
 }
@@ -142,6 +192,7 @@ enum AutomationCoordinatorError: Error, LocalizedError {
     case displayIdentityChanged(UInt32)
     case lastActiveDisplay
     case actionFailed(String)
+    case staleProfileActivationPreview
 
     var errorDescription: String? {
         switch self {
@@ -155,6 +206,8 @@ enum AutomationCoordinatorError: Error, LocalizedError {
             return "The manual action was blocked because it would remove the last active usable display."
         case .actionFailed(let message):
             return message
+        case .staleProfileActivationPreview:
+            return "The confirmed Profile activation preview is stale because its Profile or display topology changed."
         }
     }
 }
@@ -165,6 +218,20 @@ protocol DisplayManagingRuntime: AnyObject {
         _ configuration: AppConfiguration,
         observation: ObservedDisplaySnapshot?
     ) throws -> ConfigurationPreview
+    func previewProfileActivation(
+        id: UUID,
+        observation: ObservedDisplaySnapshot?
+    ) throws -> ProfileActivationPreview
+    @discardableResult func activateProfile(id: UUID) throws -> ProfileActivationResult
+    @discardableResult func activateProfile(id: UUID, confirmedPreview: ProfileActivationPreview) throws -> ProfileActivationResult
+    @discardableResult func createBlankProfile(named name: String) throws -> DisplayProfile
+    @discardableResult func duplicateProfile(id: UUID, named name: String) throws -> DisplayProfile
+    @discardableResult func renameProfile(id: UUID, to name: String) throws -> DisplayProfile
+    func deleteInactiveProfile(id: UUID) throws
+    @discardableResult func saveProfile(_ profile: DisplayProfile, applyImmediately: Bool) throws -> AutomationRuntimeStatus
+    @discardableResult func restoreProfileFromLastKnownGood(id: UUID) throws -> DisplayProfile
+    @discardableResult func removeInvalidProfile(fileName: String) throws -> AutomationRuntimeStatus
+    @discardableResult func reloadProfileCatalog() -> AutomationRuntimeStatus
     @discardableResult func updateConfiguration(_ configuration: AppConfiguration, applyImmediately: Bool) throws -> AutomationRuntimeStatus
     @discardableResult func performManualAction(runtimeID: UInt32, action: DisplayAction) throws -> AutomationRuntimeStatus
     func prepareDisplayRecovery(only targets: [DisplayRecoveryTarget]?) throws -> DisplayRecoveryPlan
@@ -186,12 +253,15 @@ final class AutomationCoordinator: DisplayManagingRuntime {
     private let debounceSeconds: TimeInterval
     private let maximumActionAttempts: Int
     private let suppressionSeconds: TimeInterval
+    private var liveApplicationSettingsActiveProfileID: UUID?
     private let log: (String) -> Void
     private let lock = NSRecursiveLock()
 
     private var configuration: AppConfiguration
+    private var activeProfile: DisplayProfile?
     private var runtimeState: RuntimeState
-    private var configurationIsWritable: Bool
+    private var settingsIsWritable: Bool
+    private var activeProfileIsWritable: Bool
     private var runtimeStateIsWritable: Bool
     private var automaticEnabledAfterRuntimeRecovery: Bool?
     private var baseDiagnostics: [RuntimeDiagnostic]
@@ -202,7 +272,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
     private var manualTopologyBaseline: Set<String>?
     private var manualRecoverySelfTopologyChanges: Set<String>?
     private var automaticNotBefore: Date?
-    private var shouldGenerateInitialDefaultRules: Bool
 
     var status: AutomationRuntimeStatus {
         lock.lock()
@@ -235,31 +304,52 @@ final class AutomationCoordinator: DisplayManagingRuntime {
 
         var diagnostics: [RuntimeDiagnostic] = []
         let loadedConfiguration: AppConfiguration
-        let loadSource: ConfigurationLoadSource?
+        let loadedResult: ConfigurationLoadResult?
+        let settingsOnlyResult: ApplicationSettingsLoadResult?
         do {
             let loaded = try configurationStore.loadOrMigrate()
             loadedConfiguration = loaded.configuration
-            loadSource = loaded.source
+            loadedResult = loaded
+            settingsOnlyResult = nil
             if loaded.source == .lastKnownGoodBackup {
                 diagnostics.append(RuntimeDiagnostic(
                     severity: .warning,
                     code: .configurationFallback,
                     message: loaded.primaryErrorDescription.map {
-                        "Using config.last-good.json because config.json is invalid: \($0)"
-                    } ?? "Using config.last-good.json because config.json is unavailable."
+                        "Using a last-known-good persistence generation because a primary generation is invalid: \($0)"
+                    } ?? "Using a last-known-good persistence generation because a primary generation is unavailable."
                 ))
             }
-        } catch {
-            var disabled = AppConfiguration.default
-            disabled.automatic.isEnabled = false
-            loadedConfiguration = disabled
-            loadSource = nil
-            diagnostics.append(RuntimeDiagnostic(
-                severity: .error,
-                code: .configurationUnavailable,
-                message: "Automation is disabled because neither configuration generation is usable: \(error.localizedDescription)"
-            ))
+        } catch let combinedError {
+            loadedResult = nil
+            do {
+                let settings = try configurationStore.loadApplicationSettings()
+                let unavailableProfile = DisplayProfile.blank(
+                    id: settings.settings.activeProfileID,
+                    name: "Unavailable Active Profile"
+                )
+                loadedConfiguration = AppConfiguration(settings: settings.settings, profile: unavailableProfile)
+                settingsOnlyResult = settings
+                diagnostics.append(RuntimeDiagnostic(
+                    severity: .error,
+                    code: .configurationUnavailable,
+                    message: "Automation is disabled because the Active Profile is unusable: \(combinedError.localizedDescription)"
+                ))
+            } catch let settingsError {
+                var disabled = AppConfiguration.default
+                disabled.automatic.isEnabled = false
+                loadedConfiguration = disabled
+                settingsOnlyResult = nil
+                diagnostics.append(RuntimeDiagnostic(
+                    severity: .error,
+                    code: .configurationUnavailable,
+                    message: "Automation is disabled because Application Settings and the Active Profile are unusable: \(settingsError.localizedDescription); \(combinedError.localizedDescription)"
+                ))
+            }
         }
+        let loadSource = loadedResult?.source
+
+        let catalog = configurationStore.catalog()
 
         var loadedRuntimeState: RuntimeState
         var runtimeStateWasLoaded = true
@@ -299,15 +389,16 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         }
 
         configuration = effectiveConfiguration
+        activeProfile = loadedResult?.activeProfile
         runtimeState = loadedRuntimeState
         runtimeStateIsWritable = runtimeStateWasLoaded
         automaticEnabledAfterRuntimeRecovery = runtimeStateWasLoaded
             ? nil
             : loadedConfiguration.automatic.isEnabled
-        configurationIsWritable = loadSource != nil && loadSource != .lastKnownGoodBackup
-        shouldGenerateInitialDefaultRules = (
-            loadSource == .createdDefaults || loadSource == .migratedLegacyDefaults
-        ) && effectiveConfiguration.rules.isEmpty
+        liveApplicationSettingsActiveProfileID = loadedResult?.activeProfile.id
+            ?? settingsOnlyResult?.settings.activeProfileID
+        settingsIsWritable = (loadedResult?.settingsSource ?? settingsOnlyResult?.source) == .primary
+        activeProfileIsWritable = loadedResult?.profileSource == .primary
         baseDiagnostics = diagnostics
         currentStatus = AutomationRuntimeStatus(
             configuration: effectiveConfiguration,
@@ -317,7 +408,12 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             lastTrigger: nil,
             pauseReason: nil,
             diagnostics: diagnostics,
-            configurationLoadSource: loadSource
+            configurationLoadSource: loadSource,
+            activeProfile: loadedResult?.activeProfile,
+            profileCatalog: catalog,
+            settingsGenerationSource: loadedResult?.settingsSource ?? settingsOnlyResult?.source,
+            activeProfileGenerationSource: loadedResult?.profileSource,
+            persistenceErrorDescription: loadedResult?.primaryErrorDescription ?? settingsOnlyResult?.primaryErrorDescription
         )
     }
 
@@ -331,7 +427,9 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             let snapshot = try observeAndNormalize()
             currentStatus.inventory = snapshot
             currentStatus.configuration = configuration
-            scheduleEvaluation(after: configuration.automatic.startupStabilizationSeconds, trigger: "startup")
+            if configuration.automatic.isEnabled {
+                scheduleEvaluation(after: configuration.automatic.startupStabilizationSeconds, trigger: "startup")
+            }
             restartPolling()
             publishStatus()
         } catch {
@@ -352,6 +450,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
     func handleWake() {
         lock.lock()
         defer { lock.unlock() }
+        guard configuration.automatic.isEnabled else { return }
         scheduleEvaluation(after: configuration.automatic.wakeStabilizationSeconds, trigger: "wake")
     }
 
@@ -374,6 +473,375 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             cycleAnalysis: cycleAnalyzer.analyze(configuration: candidate, initialSnapshot: snapshot)
         )
     }
+    func previewProfileActivation(
+        id: UUID,
+        observation: ObservedDisplaySnapshot?
+    ) throws -> ProfileActivationPreview {
+        lock.lock()
+        defer { lock.unlock() }
+        let loaded = try configurationStore.loadProfile(id: id)
+        let candidate = try configurationStore.previewProfile(id: id)
+        let snapshot: ObservedDisplaySnapshot
+        if let observation {
+            snapshot = observation
+        } else {
+            snapshot = try adapter.observe(configuration: candidate, runtimeState: runtimeState)
+        }
+        let evaluationCandidate = configurationForEvaluation(candidate, forceActions: true)
+        return ProfileActivationPreview(
+            profile: loaded.profile,
+            evaluation: evaluator.evaluate(configuration: evaluationCandidate, snapshot: snapshot),
+            cycleAnalysis: cycleAnalyzer.analyze(configuration: evaluationCandidate, initialSnapshot: snapshot),
+            profileSource: loaded.source,
+            primaryErrorDescription: loaded.primaryErrorDescription,
+            policyFingerprint: policyFingerprint(snapshot)
+        )
+    }
+
+    @discardableResult
+    func activateProfile(id: UUID) throws -> ProfileActivationResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try activateProfileLocked(id: id, confirmedPreview: nil)
+    }
+
+    @discardableResult
+    func activateProfile(
+        id: UUID,
+        confirmedPreview: ProfileActivationPreview
+    ) throws -> ProfileActivationResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try activateProfileLocked(id: id, confirmedPreview: confirmedPreview)
+    }
+
+    private func activateProfileLocked(
+        id: UUID,
+        confirmedPreview: ProfileActivationPreview?
+    ) throws -> ProfileActivationResult {
+        let candidate = try configurationStore.previewProfile(id: id)
+        let target = try configurationStore.loadProfile(id: id)
+        let previewSnapshot = try adapter.observe(
+            configuration: candidate,
+            runtimeState: runtimeState
+        )
+        let fingerprint = policyFingerprint(previewSnapshot)
+        if let confirmedPreview,
+           confirmedPreview.profile != target.profile
+            || confirmedPreview.profileSource != target.source
+            || confirmedPreview.policyFingerprint != fingerprint {
+            throw AutomationCoordinatorError.staleProfileActivationPreview
+        }
+        let confirmedIntents = confirmedPreview.map { preview in
+            Set(preview.evaluation.winningActions.map {
+                ConfirmedActionIntent(display: $0.display, action: $0.action)
+            })
+        }
+        try recoverRuntimeStatePersistenceIfNeeded()
+
+        let activatedConfiguration: AppConfiguration
+        let activatedProfile: DisplayProfile
+        let activationSource: ConfigurationLoadSource
+        let activatedProfileSource: PersistenceGenerationSource
+        let activationErrorDescription: String?
+        if confirmedPreview != nil {
+            let beforePersistence = try configurationStore.loadProfile(id: id)
+            guard beforePersistence.profile == target.profile,
+                  beforePersistence.source == target.source else {
+                throw AutomationCoordinatorError.staleProfileActivationPreview
+            }
+            let settingsLoad = try configurationStore.loadApplicationSettings()
+            var settings = settingsLoad.settings
+            settings.activeProfileID = id
+            try configurationStore.saveApplicationSettings(settings)
+            activatedConfiguration = AppConfiguration(settings: settings, profile: target.profile)
+            activatedProfile = target.profile
+            activatedProfileSource = target.source
+            activationSource = target.source == .primary ? .primary : .lastKnownGoodBackup
+            activationErrorDescription = target.primaryErrorDescription
+        } else {
+            let loaded = try configurationStore.activateProfile(id: id)
+            activatedConfiguration = loaded.configuration
+            activatedProfile = loaded.activeProfile
+            activatedProfileSource = loaded.profileSource
+            activationSource = loaded.source
+            activationErrorDescription = loaded.primaryErrorDescription
+        }
+
+        let evaluationCandidate = configurationForEvaluation(activatedConfiguration, forceActions: true)
+        let preview = ProfileActivationPreview(
+            profile: activatedProfile,
+            evaluation: evaluator.evaluate(configuration: evaluationCandidate, snapshot: previewSnapshot),
+            cycleAnalysis: cycleAnalyzer.analyze(configuration: evaluationCandidate, initialSnapshot: previewSnapshot),
+            profileSource: activatedProfileSource,
+            primaryErrorDescription: activationErrorDescription,
+            policyFingerprint: fingerprint
+        )
+
+        // The selector is now durable. A later stale check may stop hardware, but
+        // must never roll back or select another Profile.
+        configuration = activatedConfiguration
+        activeProfile = activatedProfile
+        baseDiagnostics.removeAll {
+            $0.code == .configurationUnavailable || $0.code == .configurationFallback
+        }
+        if activationSource == .lastKnownGoodBackup {
+            baseDiagnostics.append(RuntimeDiagnostic(
+                severity: .warning,
+                code: .configurationFallback,
+                message: activationErrorDescription.map {
+                    "The Active Profile uses its last-known-good generation: \($0)"
+                } ?? "The Active Profile uses its last-known-good generation."
+            ))
+        }
+        currentStatus.diagnostics = baseDiagnostics
+        currentStatus.externalActiveProfileID = nil
+        liveApplicationSettingsActiveProfileID = id
+        settingsIsWritable = true
+        activeProfileIsWritable = activatedProfileSource == .primary
+        currentStatus.configurationLoadSource = activationSource
+        currentStatus.settingsGenerationSource = .primary
+        currentStatus.activeProfileGenerationSource = activatedProfileSource
+        currentStatus.persistenceErrorDescription = activationErrorDescription
+        currentStatus.activeProfile = activatedProfile
+        currentStatus.configuration = activatedConfiguration
+        currentStatus.pauseReason = nil
+        manualTopologyBaseline = nil
+        manualRecoverySelfTopologyChanges = nil
+        generation += 1
+        pendingEvaluation?.cancel()
+        pendingEvaluation = nil
+        automaticNotBefore = nil
+        restartPolling()
+        refreshCatalogStatus()
+
+        var postPersistenceProfileIsStale = false
+        if confirmedPreview != nil {
+            do {
+                let currentTarget = try configurationStore.loadProfile(id: id)
+                postPersistenceProfileIsStale = currentTarget.profile != activatedProfile
+                    || currentTarget.source != activatedProfileSource
+            } catch {
+                postPersistenceProfileIsStale = true
+            }
+        }
+
+        let hardwareOutcome: ProfileHardwareApplicationOutcome
+        if postPersistenceProfileIsStale {
+            hardwareOutcome = .failed
+            currentStatus.diagnostics = baseDiagnostics + [RuntimeDiagnostic(
+                severity: .error,
+                code: .actionFailed,
+                message: "The Active Profile was persisted, but hardware was not applied because the confirmed Profile generation became stale."
+            )]
+        } else {
+            do {
+                hardwareOutcome = try evaluateAndMaybeApply(
+                    trigger: "profile-activation",
+                    applyActions: true,
+                    forceActions: true,
+                    reconcileRecoveryEvidence: true,
+                    requiredInitialFingerprint: confirmedPreview == nil ? nil : fingerprint,
+                    requiredProfileGeneration: confirmedPreview == nil
+                        ? nil
+                        : ConfirmedProfileGeneration(profile: activatedProfile, source: activatedProfileSource),
+                    allowedActionIntents: confirmedIntents
+                )
+            } catch {
+                if let coordinatorError = error as? AutomationCoordinatorError,
+                   case .lastActiveDisplay = coordinatorError {
+                    hardwareOutcome = .blockedBySafety
+                } else {
+                    hardwareOutcome = .failed
+                }
+                let diagnostic = RuntimeDiagnostic(
+                    severity: .error,
+                    code: .actionFailed,
+                    message: "The Active Profile was persisted, but its hardware plan did not complete: \(error.localizedDescription)"
+                )
+                currentStatus.diagnostics = baseDiagnostics + [diagnostic]
+                log("[PROFILE] activation hardware application failed after persistence: \(error.localizedDescription)")
+            }
+        }
+
+        refreshCatalogStatus()
+        let resultProfile = activeProfile ?? activatedProfile
+        var resultPreview = preview
+        resultPreview.profile = resultProfile
+        resultPreview.profileSource = currentStatus.activeProfileGenerationSource ?? preview.profileSource
+        resultPreview.primaryErrorDescription = currentStatus.persistenceErrorDescription
+        let actionCodes: Set<RuntimeDiagnosticCode> = [
+            .actionFailed, .actionSuppressed, .safetyRecovery, .statePersistenceFailed
+        ]
+        let result = ProfileActivationResult(
+            activeProfile: resultProfile,
+            preview: resultPreview,
+            hardwareOutcome: hardwareOutcome,
+            actionDiagnostics: currentStatus.diagnostics.filter { actionCodes.contains($0.code) }
+        )
+        currentStatus.lastProfileActivation = result
+        restartPolling()
+        publishStatus()
+        return result
+    }
+
+    @discardableResult
+    func createBlankProfile(named name: String) throws -> DisplayProfile {
+        lock.lock()
+        defer { lock.unlock() }
+        try recoverRuntimeStatePersistenceIfNeeded()
+        let profile = try configurationStore.createBlankProfile(named: name)
+        refreshCatalogStatus()
+        publishStatus()
+        return profile
+    }
+
+    @discardableResult
+    func duplicateProfile(id: UUID, named name: String) throws -> DisplayProfile {
+        lock.lock()
+        defer { lock.unlock() }
+        try recoverRuntimeStatePersistenceIfNeeded()
+        let profile = try configurationStore.duplicateProfile(id: id, named: name)
+        refreshCatalogStatus()
+        publishStatus()
+        return profile
+    }
+
+    @discardableResult
+    func renameProfile(id: UUID, to name: String) throws -> DisplayProfile {
+        lock.lock()
+        defer { lock.unlock() }
+        try recoverRuntimeStatePersistenceIfNeeded()
+        let profile = try configurationStore.renameProfile(id: id, to: name)
+        if activeProfile?.id == id {
+            markActiveProfilePersistedPrimary(profile)
+        }
+        refreshCatalogStatus()
+        publishStatus()
+        return profile
+    }
+
+    func deleteInactiveProfile(id: UUID) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try recoverRuntimeStatePersistenceIfNeeded()
+        guard activeProfile?.id != id else {
+            throw ConfigurationStoreError.cannotDeleteActiveProfile
+        }
+        try configurationStore.deleteProfile(id: id)
+        refreshCatalogStatus()
+        publishStatus()
+    }
+
+    @discardableResult
+    func saveProfile(_ profile: DisplayProfile, applyImmediately: Bool) throws -> AutomationRuntimeStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        try profile.validate()
+        try recoverRuntimeStatePersistenceIfNeeded()
+        try configurationStore.saveProfile(profile)
+        refreshCatalogStatus()
+
+        guard activeProfile?.id == profile.id else {
+            publishStatus()
+            return currentStatus
+        }
+
+        markActiveProfilePersistedPrimary(profile)
+        configuration = AppConfiguration(
+            settings: configuration.applicationSettings(activeProfileID: profile.id),
+            profile: profile
+        )
+        currentStatus.configuration = configuration
+        restartPolling()
+        if applyImmediately {
+            currentStatus.pauseReason = nil
+            manualTopologyBaseline = nil
+            manualRecoverySelfTopologyChanges = nil
+            _ = try evaluateAndMaybeApply(trigger: "save-and-apply", applyActions: true)
+        } else {
+            publishStatus()
+        }
+        return currentStatus
+    }
+    @discardableResult
+    func restoreProfileFromLastKnownGood(id: UUID) throws -> DisplayProfile {
+        lock.lock()
+        defer { lock.unlock() }
+        try recoverRuntimeStatePersistenceIfNeeded()
+        let profile = try configurationStore.restoreProfileFromLastKnownGood(id: id)
+        if activeProfile?.id == id {
+            configuration = AppConfiguration(
+                settings: configuration.applicationSettings(activeProfileID: id),
+                profile: profile
+            )
+            markActiveProfilePersistedPrimary(profile)
+            currentStatus.configuration = configuration
+            restartPolling()
+        }
+        refreshCatalogStatus()
+        publishStatus()
+        return profile
+    }
+
+    @discardableResult
+    func removeInvalidProfile(fileName: String) throws -> AutomationRuntimeStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        try recoverRuntimeStatePersistenceIfNeeded()
+        try configurationStore.removeInvalidProfile(fileName: fileName)
+        refreshCatalogStatus()
+        publishStatus()
+        return currentStatus
+    }
+
+    @discardableResult
+    func reloadProfileCatalog() -> AutomationRuntimeStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        refreshCatalogStatus()
+        currentStatus.externalApplicationSettings = nil
+        currentStatus.externalSettingsGenerationSource = nil
+        currentStatus.externalSettingsErrorDescription = nil
+        currentStatus.externalActiveProfileID = nil
+
+        var diskSettings: ApplicationSettingsLoadResult?
+        do {
+            let loaded = try configurationStore.loadApplicationSettings()
+            diskSettings = loaded
+            currentStatus.externalSettingsGenerationSource = loaded.source
+            currentStatus.externalSettingsErrorDescription = loaded.primaryErrorDescription
+            if let liveID = liveApplicationSettingsActiveProfileID {
+                let live = configuration.applicationSettings(activeProfileID: liveID)
+                if loaded.settings != live {
+                    currentStatus.externalApplicationSettings = loaded.settings
+                }
+                if loaded.settings.activeProfileID != liveID {
+                    currentStatus.externalActiveProfileID = loaded.settings.activeProfileID
+                }
+            } else {
+                currentStatus.externalApplicationSettings = loaded.settings
+                currentStatus.externalActiveProfileID = loaded.settings.activeProfileID
+            }
+        } catch {
+            currentStatus.externalSettingsErrorDescription = error.localizedDescription
+        }
+
+        do {
+            let disk = try configurationStore.reloadFromDisk()
+            if disk.activeProfile.id != activeProfile?.id || disk.activeProfile != activeProfile {
+                currentStatus.externalActiveProfileID = disk.activeProfile.id
+            }
+        } catch {
+            if let diskSettings,
+               activeProfile == nil || diskSettings.settings.activeProfileID == activeProfile?.id {
+                currentStatus.externalActiveProfileID = diskSettings.settings.activeProfileID
+            }
+        }
+        currentStatus.lastTrigger = "profile-catalog-reload"
+        publishStatus()
+        return currentStatus
+    }
 
     @discardableResult
     func updateConfiguration(_ candidate: AppConfiguration, applyImmediately: Bool) throws -> AutomationRuntimeStatus {
@@ -381,20 +849,45 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         defer { lock.unlock() }
         try candidate.validate()
         try recoverRuntimeStatePersistenceIfNeeded()
-        try configurationStore.save(candidate)
+        let profileFieldsChanged = candidate.automatic != configuration.automatic
+            || candidate.polling != configuration.polling
+            || candidate.rules != configuration.rules
+        let settingsFieldsChanged = candidate.hotKey != configuration.hotKey
+            || candidate.deviceHistory != configuration.deviceHistory
+        let profile: DisplayProfile?
+        if let activeProfile {
+            let candidateProfile = candidate.displayProfile(id: activeProfile.id, name: activeProfile.name)
+            if candidateProfile != activeProfile {
+                try configurationStore.saveProfile(candidateProfile)
+                markActiveProfilePersistedPrimary(candidateProfile)
+            }
+            profile = candidateProfile
+        } else {
+            guard !profileFieldsChanged else { throw ConfigurationStoreError.configurationMissing }
+            profile = nil
+        }
+        if settingsFieldsChanged {
+            let disk = try configurationStore.loadApplicationSettings()
+            var settings = disk.settings
+            settings.hotKey = candidate.hotKey
+            settings.deviceHistory = candidate.deviceHistory
+            try configurationStore.saveApplicationSettings(settings)
+            settingsIsWritable = true
+            currentStatus.settingsGenerationSource = .primary
+            refreshPersistenceRepairState()
+        }
         configuration = candidate
-        configurationIsWritable = true
-        shouldGenerateInitialDefaultRules = false
-        baseDiagnostics.removeAll { $0.code == .configurationUnavailable || $0.code == .configurationFallback }
-        currentStatus.configurationLoadSource = .primary
+        self.activeProfile = profile
+        currentStatus.activeProfile = profile
         currentStatus.configuration = candidate
+        refreshCatalogStatus()
         restartPolling()
 
         if applyImmediately {
             currentStatus.pauseReason = nil
             manualTopologyBaseline = nil
             manualRecoverySelfTopologyChanges = nil
-            try evaluateAndMaybeApply(trigger: "save-and-apply", applyActions: true)
+            _ = try evaluateAndMaybeApply(trigger: "save-and-apply", applyActions: true)
         } else {
             let snapshot = try observeAndNormalize()
             currentStatus.inventory = snapshot
@@ -844,7 +1337,9 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             let snapshot = try observeAndNormalize()
             currentStatus.inventory = snapshot
             resumeManualPauseIfTopologyChanged(snapshot)
-            scheduleEvaluation(after: delay, trigger: trigger)
+            if configuration.automatic.isEnabled {
+                scheduleEvaluation(after: delay, trigger: trigger)
+            }
             publishStatus()
         } catch {
             recordRuntimeError(.runtimeStateUnavailable, "\(trigger) inventory failed: \(error.localizedDescription)")
@@ -876,10 +1371,45 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         log("[AUTO] manual pause ended after an actual online identity topology change")
     }
 
-    private func evaluateAndMaybeApply(trigger: String, applyActions: Bool) throws {
+    @discardableResult
+    private func evaluateAndMaybeApply(
+        trigger: String,
+        applyActions: Bool,
+        forceActions: Bool = false,
+        reconcileRecoveryEvidence: Bool = false,
+        requiredInitialFingerprint: DisplayPolicySnapshotFingerprint? = nil,
+        requiredProfileGeneration: ConfirmedProfileGeneration? = nil,
+        allowedActionIntents: Set<ConfirmedActionIntent>? = nil
+    ) throws -> ProfileHardwareApplicationOutcome {
         var diagnostics = baseDiagnostics
         var snapshot = try observeAndNormalize()
-        let analysis = cycleAnalyzer.analyze(configuration: configuration, initialSnapshot: snapshot)
+        var confirmationIsStale = requiredInitialFingerprint.map {
+            policyFingerprint(snapshot) != $0
+        } ?? false
+        if let requiredProfileGeneration {
+            do {
+                let disk = try configurationStore.loadProfile(id: requiredProfileGeneration.profile.id)
+                confirmationIsStale = confirmationIsStale
+                    || disk.profile != requiredProfileGeneration.profile
+                    || disk.source != requiredProfileGeneration.source
+            } catch {
+                confirmationIsStale = true
+            }
+        }
+        if confirmationIsStale {
+            let diagnostic = RuntimeDiagnostic(
+                severity: .error,
+                code: .actionFailed,
+                message: "Hardware was not applied because the confirmed Profile or display topology became stale after Profile selection."
+            )
+            currentStatus.inventory = snapshot
+            currentStatus.lastTrigger = trigger
+            currentStatus.diagnostics = diagnostics + [diagnostic]
+            publishStatus()
+            return .failed
+        }
+        var evaluationConfiguration = configurationForEvaluation(configuration, forceActions: forceActions)
+        let analysis = cycleAnalyzer.analyze(configuration: evaluationConfiguration, initialSnapshot: snapshot)
         currentStatus.lastCycleAnalysis = analysis
 
         if analysis.status == .cycleDetected && !analysis.involvedRuleIDs.isEmpty {
@@ -888,34 +1418,45 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             for index in safeConfiguration.rules.indices where involved.contains(safeConfiguration.rules[index].id) {
                 safeConfiguration.rules[index].isEnabled = false
             }
-            if configurationIsWritable {
+            if activeProfileIsWritable, let profile = activeProfile {
                 do {
-                    try configurationStore.save(safeConfiguration)
+                    let safeProfile = safeConfiguration.displayProfile(id: profile.id, name: profile.name)
+                    try configurationStore.saveProfile(safeProfile)
+                    markActiveProfilePersistedPrimary(safeProfile)
+                    diagnostics.removeAll { $0.code == .configurationFallback }
                 } catch {
-                    configurationIsWritable = false
+                    activeProfileIsWritable = false
                     diagnostics.append(RuntimeDiagnostic(
                         severity: .error,
                         code: .configurationUnavailable,
-                        message: "Cycle participants were disabled in memory but could not be persisted: \(error.localizedDescription)"
+                        message: "Cycle participants were disabled in memory but the Active Profile could not be persisted: \(error.localizedDescription)"
                     ))
                 }
             }
             configuration = safeConfiguration
+            if let profile = activeProfile {
+                let effectiveProfile = safeConfiguration.displayProfile(id: profile.id, name: profile.name)
+                activeProfile = effectiveProfile
+                currentStatus.activeProfile = effectiveProfile
+            }
             diagnostics.append(RuntimeDiagnostic(
                 severity: .warning,
                 code: .cycleRulesDisabled,
                 message: "Rules participating in a runtime cycle were disabled: \(analysis.involvedRuleIDs.map(\.uuidString).joined(separator: ", "))."
             ))
         }
+        evaluationConfiguration = configurationForEvaluation(configuration, forceActions: forceActions)
 
-        let plan = evaluator.evaluate(configuration: configuration, snapshot: snapshot)
+        let plan = evaluator.evaluate(configuration: evaluationConfiguration, snapshot: snapshot)
         currentStatus.configuration = configuration
         currentStatus.inventory = snapshot
         currentStatus.lastEvaluation = plan
         currentStatus.lastTrigger = trigger
         logEvaluation(trigger: trigger, snapshot: snapshot, plan: plan)
 
-        guard applyActions, configuration.automatic.isEnabled, currentStatus.pauseReason == nil else {
+        guard applyActions,
+              (forceActions || configuration.automatic.isEnabled),
+              currentStatus.pauseReason == nil else {
             if currentStatus.pauseReason != nil {
                 diagnostics.append(RuntimeDiagnostic(
                     severity: .info,
@@ -925,7 +1466,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             }
             currentStatus.diagnostics = diagnostics
             publishStatus()
-            return
+            return .notNeeded
         }
 
         let boundFingerprint = policyFingerprint(snapshot)
@@ -934,27 +1475,65 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         runtimeState.failureSuppressions.removeAll { $0.suppressedUntil <= now }
         if oldSuppressionCount != runtimeState.failureSuppressions.count { try persistRuntimeState() }
 
-        if !plan.winningActions.isEmpty {
-            diagnostics.append(contentsOf: try applyWithRetries(
-                initialSnapshot: snapshot,
-                initialPlan: plan,
-                boundFingerprint: boundFingerprint
+        let hasTransitionRestores = reconcileRecoveryEvidence && !recoveryPlan(for: snapshot).isEmpty
+        let hasSafetyBlocks = !plan.safetyBlocks.isEmpty
+        if hasSafetyBlocks {
+            diagnostics.append(RuntimeDiagnostic(
+                severity: .warning,
+                code: .safetyRecovery,
+                message: "One or more Profile actions were blocked to preserve an active usable display."
             ))
-            snapshot = try observeAndNormalize()
-            currentStatus.inventory = snapshot
         }
+        guard !plan.winningActions.isEmpty || hasTransitionRestores else {
+            currentStatus.diagnostics = diagnostics
+            publishStatus()
+            return hasSafetyBlocks ? .blockedBySafety : .notNeeded
+        }
+
+        let report = try applyWithRetries(
+            initialSnapshot: snapshot,
+            initialPlan: plan,
+            boundFingerprint: boundFingerprint,
+            reconcileRecoveryEvidence: reconcileRecoveryEvidence,
+            forceActions: forceActions,
+            allowedActionIntents: allowedActionIntents
+        )
+        diagnostics.append(contentsOf: report.diagnostics)
         currentStatus.diagnostics = diagnostics
+        if report.outcome != .notNeeded {
+            do {
+                snapshot = try observeAndNormalize()
+                currentStatus.inventory = snapshot
+            } catch {
+                diagnostics.append(RuntimeDiagnostic(
+                    severity: .error,
+                    code: .actionFailed,
+                    message: "Hardware actions completed, but the final inventory refresh failed: \(error.localizedDescription)"
+                ))
+                currentStatus.diagnostics = diagnostics
+            }
+        }
         publishStatus()
+        if hasSafetyBlocks && report.outcome == .applied { return .partiallyFailed }
+        if hasSafetyBlocks && report.outcome == .notNeeded { return .blockedBySafety }
+        return report.outcome
     }
 
     private func applyWithRetries(
         initialSnapshot: ObservedDisplaySnapshot,
         initialPlan: RuleEvaluationPlan,
-        boundFingerprint: DisplayPolicySnapshotFingerprint
-    ) throws -> [RuntimeDiagnostic] {
-        var retryKeys: Set<String>?
+        boundFingerprint: DisplayPolicySnapshotFingerprint,
+        reconcileRecoveryEvidence: Bool,
+        forceActions: Bool,
+        allowedActionIntents: Set<ConfirmedActionIntent>?
+    ) throws -> HardwareApplicationReport {
         var finalFailures: [DisplayActionResult] = []
         var diagnostics: [RuntimeDiagnostic] = []
+        var settledActions: [EvaluatedDisplayKey: DisplayAction] = [:]
+        var attemptedAnyAction = false
+        var confirmedAnyAction = false
+        var safetyBlocked = false
+        var stalePlanExhausted = false
         let initialMatchesBinding = policyFingerprint(initialSnapshot) == boundFingerprint
 
         for attempt in 1...maximumActionAttempts {
@@ -962,15 +1541,36 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             let freshFingerprint = policyFingerprint(freshSnapshot)
             let plan = attempt == 1 && initialMatchesBinding && freshFingerprint == boundFingerprint
                 ? initialPlan
-                : evaluator.evaluate(configuration: configuration, snapshot: freshSnapshot)
+                : evaluator.evaluate(
+                    configuration: configurationForEvaluation(configuration, forceActions: forceActions),
+                    snapshot: freshSnapshot
+                )
             currentStatus.inventory = freshSnapshot
             currentStatus.lastEvaluation = plan
 
-            var requests = plan.winningActions.map {
-                DisplayActionRequest(display: $0.display, action: $0.action)
-            }
-            if let retryKeys {
-                requests.removeAll { !retryKeys.contains(actionKey($0)) }
+            // Both ordinary rule actions and activation transition restores are
+            // derived again from this exact observation on every attempt.
+            var requests = requestsForEvaluation(
+                plan,
+                snapshot: freshSnapshot,
+                reconcileRecoveryEvidence: reconcileRecoveryEvidence,
+                allowedProfileActionIntents: allowedActionIntents
+            )
+            requests.removeAll { request in
+                guard settledActions[request.display] == request.action,
+                      let observed = freshSnapshot.displays.first(where: {
+                          $0.runtimeID == request.display.runtimeID
+                              && $0.stableIdentity == request.display.stableIdentity
+                              && $0.family == request.display.family
+                      }) else { return false }
+                switch request.action {
+                case .noAction:
+                    return true
+                case .enable:
+                    return observed.state.isOnline
+                case .disable:
+                    return !observed.state.isOnline
+                }
             }
             try enforceActiveSafety(requests: requests, snapshot: freshSnapshot)
             requests.removeAll { request in
@@ -992,6 +1592,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
                 finalFailures = []
                 break
             }
+            attemptedAnyAction = true
 
             try journalPendingDisables(requests, snapshot: freshSnapshot)
             let outcome: DisplayTransactionOutcome
@@ -1034,49 +1635,100 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             )
             if outcome.requiresReevaluation {
                 try clearPendingForKnownUncommittedFailures(outcome)
-                retryKeys = nil
+                if attempt == maximumActionAttempts { stalePlanExhausted = true }
                 continue
             }
             try applyConfirmedResults(outcome.results)
             try clearPendingForKnownUncommittedFailures(outcome)
+            for result in outcome.results where result.succeeded {
+                settledActions[result.request.display] = result.request.action
+                confirmedAnyAction = true
+            }
             if let safety = try recoverIfCommittedWithoutActiveDisplay(
                 outcome: outcome,
                 disableRequests: requests
             ) {
                 diagnostics.append(safety)
+                safetyBlocked = true
                 finalFailures = []
                 break
             }
 
             finalFailures = outcome.results.filter { !$0.succeeded }
-            retryKeys = Set(finalFailures.map { actionKey($0.request) })
             if finalFailures.isEmpty { break }
             log("[AUTO] display action attempt \(attempt)/\(maximumActionAttempts) failed for runtime IDs \(finalFailures.map { $0.request.display.runtimeID })")
         }
 
-        guard !finalFailures.isEmpty else { return diagnostics }
-        let now = scheduler.now
-        for failure in finalFailures {
-            let target = suppressionTarget(for: failure.request.display)
-            let previous = runtimeState.failureSuppressions.first { $0.target == target && $0.action == failure.request.action }
-            runtimeState.failureSuppressions.removeAll { $0.target == target && $0.action == failure.request.action }
-            runtimeState.failureSuppressions.append(FailureSuppressionRecord(
-                target: target,
-                action: failure.request.action,
-                consecutiveFailureCount: (previous?.consecutiveFailureCount ?? 0) + 1,
-                suppressedUntil: now.addingTimeInterval(suppressionSeconds),
-                lastError: failure.errorDescription ?? "Unknown display action failure"
-            ))
+        if !finalFailures.isEmpty {
+            let now = scheduler.now
+            for failure in finalFailures {
+                let target = suppressionTarget(for: failure.request.display)
+                let previous = runtimeState.failureSuppressions.first { $0.target == target && $0.action == failure.request.action }
+                runtimeState.failureSuppressions.removeAll { $0.target == target && $0.action == failure.request.action }
+                runtimeState.failureSuppressions.append(FailureSuppressionRecord(
+                    target: target,
+                    action: failure.request.action,
+                    consecutiveFailureCount: (previous?.consecutiveFailureCount ?? 0) + 1,
+                    suppressedUntil: now.addingTimeInterval(suppressionSeconds),
+                    lastError: failure.errorDescription ?? "Unknown display action failure"
+                ))
+            }
+            try persistRuntimeState()
+            diagnostics.append(contentsOf: finalFailures.map {
+                RuntimeDiagnostic(
+                    severity: .error,
+                    code: .actionFailed,
+                    message: "\($0.request.action.rawValue) failed for runtime display \($0.request.display.runtimeID): \($0.errorDescription ?? "unknown error")"
+                )
+            })
         }
-        try persistRuntimeState()
-        diagnostics.append(contentsOf: finalFailures.map {
-            RuntimeDiagnostic(
+        if stalePlanExhausted {
+            diagnostics.append(RuntimeDiagnostic(
                 severity: .error,
                 code: .actionFailed,
-                message: "\($0.request.action.rawValue) failed for runtime display \($0.request.display.runtimeID): \($0.errorDescription ?? "unknown error")"
-            )
-        })
-        return diagnostics
+                message: "Display actions were not applied because the observed policy snapshot changed on every retry."
+            ))
+        }
+
+        let outcome: ProfileHardwareApplicationOutcome
+        if safetyBlocked {
+            outcome = .blockedBySafety
+        } else if stalePlanExhausted {
+            outcome = confirmedAnyAction ? .partiallyFailed : .failed
+        } else if !finalFailures.isEmpty {
+            outcome = confirmedAnyAction ? .partiallyFailed : .failed
+        } else if diagnostics.contains(where: { $0.code == .actionSuppressed }) {
+            outcome = confirmedAnyAction ? .partiallyFailed : .failed
+        } else {
+            outcome = attemptedAnyAction ? .applied : .notNeeded
+        }
+        return HardwareApplicationReport(outcome: outcome, diagnostics: diagnostics)
+    }
+
+    private func requestsForEvaluation(
+        _ plan: RuleEvaluationPlan,
+        snapshot: ObservedDisplaySnapshot,
+        reconcileRecoveryEvidence: Bool,
+        allowedProfileActionIntents: Set<ConfirmedActionIntent>? = nil
+    ) -> [DisplayActionRequest] {
+        var profileRequests = plan.winningActions.map {
+            DisplayActionRequest(display: $0.display, action: $0.action)
+        }
+        if let allowedProfileActionIntents {
+            profileRequests.removeAll {
+                !allowedProfileActionIntents.contains(
+                    ConfirmedActionIntent(display: $0.display, action: $0.action)
+                )
+            }
+        }
+        var requests = Dictionary(uniqueKeysWithValues: profileRequests.map { ($0.display, $0) })
+        if reconcileRecoveryEvidence {
+            for target in recoveryPlan(for: snapshot).targets {
+                if requests[target.display]?.action == .disable { continue }
+                requests[target.display] = DisplayActionRequest(display: target.display, action: .enable)
+            }
+        }
+        return requests.values.sorted { lhs, rhs in lhs.display < rhs.display }
     }
 
     private func applyConfirmedResults(_ results: [DisplayActionResult]) throws {
@@ -1210,50 +1862,49 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         }
         if stateChanged { try persistRuntimeState() }
 
-        if updateDisplayHistoryAndDefaultRules(from: snapshot) {
+        if updateDisplayHistory(from: snapshot) {
             snapshot = try adapter.observe(configuration: configuration, runtimeState: runtimeState)
         }
         currentStatus.recoveryPlan = recoveryPlan(for: snapshot)
         return snapshot
     }
 
-    private func updateDisplayHistoryAndDefaultRules(from snapshot: ObservedDisplaySnapshot) -> Bool {
-        guard configurationIsWritable, runtimeStateIsWritable else { return false }
-        var updated = configuration
+    private func updateDisplayHistory(from snapshot: ObservedDisplaySnapshot) -> Bool {
+        guard runtimeStateIsWritable else { return false }
+        var changed = false
 
-        for display in snapshot.displays where display.state.isOnline && display.family.isValid {
-            let target: DisplayTarget = display.stableIdentity.map(DisplayTarget.exact) ?? .family(display.family)
-            if let index = updated.deviceHistory.firstIndex(where: { $0.target == target }) {
-                if updated.deviceHistory[index].name != display.name || updated.deviceHistory[index].isBuiltIn != display.isBuiltIn {
-                    updated.deviceHistory[index].name = display.name
-                    updated.deviceHistory[index].isBuiltIn = display.isBuiltIn
+        if settingsIsWritable {
+            var updated = configuration
+            for display in snapshot.displays where display.state.isOnline && display.family.isValid {
+                let target: DisplayTarget = display.stableIdentity.map(DisplayTarget.exact) ?? .family(display.family)
+                if let index = updated.deviceHistory.firstIndex(where: { $0.target == target }) {
+                    if updated.deviceHistory[index].name != display.name || updated.deviceHistory[index].isBuiltIn != display.isBuiltIn {
+                        updated.deviceHistory[index].name = display.name
+                        updated.deviceHistory[index].isBuiltIn = display.isBuiltIn
+                    }
+                } else {
+                    updated.deviceHistory.append(KnownDisplay(target: target, name: display.name, isBuiltIn: display.isBuiltIn))
                 }
-            } else {
-                updated.deviceHistory.append(KnownDisplay(target: target, name: display.name, isBuiltIn: display.isBuiltIn))
+            }
+            if updated.deviceHistory != configuration.deviceHistory {
+                do {
+                    try configurationStore.saveApplicationSettings(from: updated)
+                    configuration.deviceHistory = updated.deviceHistory
+                    currentStatus.configuration = configuration
+                    currentStatus.settingsGenerationSource = .primary
+                    changed = true
+                } catch {
+                    settingsIsWritable = false
+                    baseDiagnostics.append(RuntimeDiagnostic(
+                        severity: .error,
+                        code: .configurationUnavailable,
+                        message: "Display History Records could not be persisted: \(error.localizedDescription)"
+                    ))
+                }
             }
         }
-        if shouldGenerateInitialDefaultRules,
-           updated.rules.isEmpty,
-           let builtIn = updated.deviceHistory.first(where: { $0.isBuiltIn }) {
-            updated.rules = LegacyConfigurationMigrator.defaultExternalRules(target: builtIn.target)
-            shouldGenerateInitialDefaultRules = false
-        }
-        guard updated != configuration else { return false }
 
-        do {
-            try configurationStore.save(updated)
-            configuration = updated
-            currentStatus.configuration = updated
-            return true
-        } catch {
-            configurationIsWritable = false
-            baseDiagnostics.append(RuntimeDiagnostic(
-                severity: .error,
-                code: .configurationUnavailable,
-                message: "Display history could not be persisted: \(error.localizedDescription)"
-            ))
-            return false
-        }
+        return changed
     }
 
     private func recoveryPlan(for snapshot: ObservedDisplaySnapshot) -> DisplayRecoveryPlan {
@@ -1720,6 +2371,33 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         }
     }
 
+    private func markActiveProfilePersistedPrimary(_ profile: DisplayProfile) {
+        activeProfile = profile
+        activeProfileIsWritable = true
+        currentStatus.activeProfile = profile
+        currentStatus.activeProfileGenerationSource = .primary
+        refreshPersistenceRepairState()
+    }
+
+    private func refreshPersistenceRepairState() {
+        guard currentStatus.settingsGenerationSource == .primary,
+              currentStatus.activeProfileGenerationSource == .primary else { return }
+        currentStatus.configurationLoadSource = .primary
+        currentStatus.persistenceErrorDescription = nil
+        baseDiagnostics.removeAll { $0.code == .configurationFallback }
+        currentStatus.diagnostics.removeAll { $0.code == .configurationFallback }
+    }
+
+    private func configurationForEvaluation(
+        _ source: AppConfiguration,
+        forceActions: Bool
+    ) -> AppConfiguration {
+        guard forceActions else { return source }
+        var forced = source
+        forced.automatic.isEnabled = true
+        return forced
+    }
+
     private func suppressionTarget(for display: EvaluatedDisplayKey) -> DisplayTarget {
         display.stableIdentity.map(DisplayTarget.exact) ?? .family(display.family)
     }
@@ -1740,6 +2418,10 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         })
     }
 
+    private func refreshCatalogStatus() {
+        currentStatus.profileCatalog = configurationStore.catalog()
+    }
+
     private func recordRuntimeError(_ code: RuntimeDiagnosticCode, _ message: String) {
         currentStatus.diagnostics = baseDiagnostics + [RuntimeDiagnostic(severity: .error, code: code, message: message)]
         log("[AUTO] \(message)")
@@ -1748,6 +2430,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
 
     private func publishStatus() {
         currentStatus.configuration = configuration
+        currentStatus.activeProfile = activeProfile
         onStatusChange?()
     }
 }

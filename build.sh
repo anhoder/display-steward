@@ -33,6 +33,7 @@ swiftc -O \
     -o "$CONTENTS_DIR/MacOS/DisplaySteward"
 
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$ROOT_DIR/Assets/DisplaySteward.icns" "$CONTENTS_DIR/Resources/DisplaySteward.icns"
 
 codesign --force --deep --sign - "$APP_DIR" >/dev/null
 printf 'Built: %s\n' "$APP_DIR"

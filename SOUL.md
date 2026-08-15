@@ -10,11 +10,13 @@ Prefer a stable, explainable screen state over a clever transition. Make the saf
 
 ## Principles
 
-### Rules are the policy
+### Profiles own the policy
 
-Multiple ordered rules express intent. Conditions inside a rule are AND; multiple rules express OR. Matching rules merge, higher-priority explicit actions win per display, and no-action contributes no opinion. An empty rule list is valid and means no automatic display action.
+Exactly one manually selected Active Profile supplies Automation timing, polling, and Rules. Profiles are named reusable policies such as office or home; they are never selected automatically from display topology, and they never capture modes, layout, primary-display choice, or transient display state.
 
-The two Chinese external-present defaults are visible, editable rules generated only when a reliable built-in target is available. They are not a second policy embedded in runtime code.
+Multiple ordered Rules inside a Profile express intent. Conditions inside a Rule are AND; multiple Rules express OR. Matching Rules merge, higher-priority explicit actions win per display, and no-action contributes no opinion. An empty Rule list is valid and means no automatic display action. A newly created blank Profile starts with Automation and polling off.
+
+The two Chinese external-present defaults remain visible, editable Rules only when imported from an existing configuration that already supplied them. They are not a second policy embedded in runtime code.
 
 ### Reconcile, do not flip
 
@@ -30,15 +32,19 @@ Retain at least one active usable display. Prefer the current main display on eq
 
 ### User control without stale overwrites
 
-The overview, menu, Rules page, Displays page, and configurable `⌃⌥⌘D` built-in toggle all read the same current status. Rule drafts merge only rules into current settings when saved, so concurrent polling, shortcut, alias, history, and automatic-state changes are preserved. Manual display actions use the same safety path and pause automation until a real topology change, Resume, restart, or Save and Apply.
+The overview, menu, Profile editor, Rules page, Displays page, and configurable `⌃⌥⇧D` built-in toggle read the same current status. The status menu can activate a Profile quickly, but it must resolve dirty Profile drafts first, re-observe the display topology, preview the exact persisted Profile generation, and bind confirmation to that Profile and topology before applying any display action.
 
-Preview is strictly read-only. It evaluates an injected or current snapshot without saving configuration, changing recovery state, querying an unrelated display state, or applying a transaction.
+Settings distinguishes the Profile being edited from the Active Profile. Name, Automation, polling, and Rules share one identity-bound draft; ordinary list navigation never activates it. Saving an inactive draft has no runtime effect, while Active Save and Apply and explicit activation use the coordinator. The global hotkey, display history, recovery evidence, and manual display controls remain application-wide.
+
+Preview is strictly read-only. It evaluates an injected or freshly observed snapshot without saving configuration, changing recovery state, or applying a transaction. A stale confirmation is refused before the Active selector or hardware changes.
 
 ### JSON owns configuration
 
-Validated configuration lives at `~/.config/display-steward/config.json` with `config.last-good.json` as fallback. Current-boot recovery state lives at `runtime-state.json`. Existing UserDefaults and the former `~/.config/screen-manager` directory are imported once only when the Display Steward JSON configuration is absent; afterward the new JSON location is the sole writable source and old defaults remain untouched and inert.
+Validated application settings live at `~/.config/display-steward/config.json` with `config.last-good.json` as fallback. Each Display Profile has one canonical `profiles/<uuid>.json` file and an independent `profiles/last-good/<uuid>.json` safety generation. Current-boot recovery state remains application-wide in `runtime-state.json`.
 
-Corrupt data is evidence. Fall back without overwriting it. If neither configuration generation is usable, disable automation and report the failure instead of guessing.
+Existing monolithic JSON, UserDefaults, and the former `~/.config/screen-manager` directory are imported once when split settings are absent. Existing rules and timing migrate unchanged into an ordinary `默认` Profile; afterward the split JSON files are the sole writable source and old defaults remain untouched and inert.
+
+Corrupt data is evidence. Fall back only to the matching settings/Profile safety generation without overwriting the bad file or choosing another Profile. Explicit restore and removal are user actions. If the Active Profile has no usable generation, disable Automation and report the failure instead of guessing.
 
 ### Native and bounded
 
@@ -54,4 +60,4 @@ Build, test, install, and inspect through checked-in scripts. Deterministic phas
 
 ## Completion standard
 
-A change is complete when focused tests protect its observable contract, the app bundle and plists are valid, one coordinator and one JSON configuration source remain, the UI describes state truthfully, and any authorized real smoke preserves an active screen with matching status and log evidence.
+A change is complete when focused tests protect its observable contract, the app bundle and plists are valid, one coordinator owns one Active Profile plus application-wide settings and recovery state, the UI describes selection and hardware outcomes truthfully, and any authorized real smoke preserves an active screen with matching status and evidence.

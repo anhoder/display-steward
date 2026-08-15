@@ -4,6 +4,35 @@ Display Steward manages macOS display state through explainable rules and explic
 
 ## Language
 
+**Display Profile（显示配置档）**:
+A uniquely named set of Automation settings and Rules with a stable identity. One local canonical file persists each Profile, but the Profile is the domain object rather than the file itself.
+_Avoid_: Scene, location, configuration file, display snapshot
+
+**Active Profile（当前配置档）**:
+The single Display Profile manually selected to govern display behavior. It remains active across application and system restarts until the user selects another Profile.
+_Avoid_: Detected profile, automatic profile
+
+**Application Settings（应用设置）**:
+Settings shared by every Display Profile, including the application hotkey and Display History Records.
+_Avoid_: Global profile, default profile
+
+**Automation（自动化）**:
+The mechanism that evaluates enabled Rules in the Active Profile and applies their resolved display actions. Stopping or pausing Automation does not change whether individual Rules are enabled.
+_Avoid_: Automatic rules, rule enablement
+
+**Rule（规则）**:
+A condition-and-action policy that belongs to one Display Profile and can remain enabled or disabled independently of Automation's running state.
+_Avoid_: Automation, automatic rule
+
+**Current Display（当前显示器）**:
+A display represented by current observation rather than configuration history alone. It may be active, online, or carry current-startup recovery evidence.
+_Avoid_: Known display, historical display
+
+**Display History Record（显示器历史记录）**:
+A persisted display identity, name, and optional alias retained for recognition and Rule references when the display is not currently observed. It is not evidence of a physical connection or a recoverable state.
+_Avoid_: Offline display, current display, Recoverable Display
+
+
 **Recoverable Display（可恢复显示器）**:
 A display for which Display Steward retains current-startup evidence that one of its disable attempts may be responsible for the display state. It includes confirmed disables and unresolved interrupted attempts, and excludes ordinary display history.
 _Avoid_: App-disabled display, offline display, historical display

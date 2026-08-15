@@ -8,6 +8,8 @@
     <string>Display Steward</string>
     <key>CFBundleExecutable</key>
     <string>DisplaySteward</string>
+    <key>CFBundleIconFile</key>
+    <string>DisplaySteward.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.anhoder.display-steward</string>
     <key>CFBundleInfoDictionaryVersion</key>

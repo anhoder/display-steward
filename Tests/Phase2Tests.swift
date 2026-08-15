@@ -124,6 +124,8 @@ private final class FakeAdapter: DisplayRuntimeAdapting {
     var observationFailuresRemaining = 0
     var observationCount = 0
     var failObservationCall: Int?
+    var failCoordinatorRefreshAfterApply = false
+    var afterObservation: ((FakeAdapter, Int) -> Void)?
 
     init(_ displays: [ObservedDisplay]) {
         templates = Dictionary(uniqueKeysWithValues: displays.compactMap { item in item.runtimeID.map { ($0, item) } })
@@ -179,7 +181,9 @@ private final class FakeAdapter: DisplayRuntimeAdapting {
                 name: known.name, isBuiltIn: known.isBuiltIn, isMain: false, state: .notObserved
             ))
         }
-        return .init(displays: result)
+        let snapshot = ObservedDisplaySnapshot(displays: result)
+        afterObservation?(self, observationCount)
+        return snapshot
     }
 
     func apply(
@@ -290,9 +294,14 @@ private final class FakeAdapter: DisplayRuntimeAdapting {
         }
         delayedOfflineIDs.removeAll()
         afterCommit?(self, requests)
+        let after = try observe(configuration: configuration, runtimeState: runtimeState)
+        if failCoordinatorRefreshAfterApply {
+            failCoordinatorRefreshAfterApply = false
+            observationFailuresRemaining = 1
+        }
         return .init(
             before: before,
-            after: try observe(configuration: configuration, runtimeState: runtimeState),
+            after: after,
             results: results,
             transactionWasCommitted: committed
         )
@@ -308,6 +317,7 @@ private final class FakeAdapter: DisplayRuntimeAdapting {
 
 private struct Fixture {
     let root: URL
+    let configurationStore: ConfigurationStore
     let stateStore: RuntimeStateStore
     let adapter: FakeAdapter
     let clock: Clock
@@ -330,7 +340,14 @@ private func fixture(
         adapter: adapter, scheduler: clock, debounceSeconds: 1,
         maximumActionAttempts: attempts, suppressionSeconds: 30
     )
-    return .init(root: root, stateStore: stateStore, adapter: adapter, clock: clock, coordinator: coordinator)
+    return .init(
+        root: root,
+        configurationStore: configStore,
+        stateStore: stateStore,
+        adapter: adapter,
+        clock: clock,
+        coordinator: coordinator
+    )
 }
 
 @main
@@ -1275,6 +1292,911 @@ private enum Phase2Tests {
             try equal(value.adapter.observationCount, 4, "successful single recovery performed a failure-prone extra refresh")
             let persisted = try value.stateStore.load().state
             try expect(persisted.pendingRecoveryDisplays.isEmpty && persisted.pendingDisableDisplays.isEmpty, "successful single recovery retained settled evidence")
+        }
+
+        runner.run("fresh root stays Automation-off without hidden rules or startup work") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-fresh-profile-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+            let stateStore = RuntimeStateStore(rootURL: root, legacyDefaults: nil, bootIdentifierProvider: { "boot" })
+            let clock = Clock()
+            let coordinator = try AutomationCoordinator(
+                configurationStore: store,
+                runtimeStateStore: stateStore,
+                adapter: FakeAdapter([display(1, builtIn, builtInFamily, builtIn: true, main: true)]),
+                scheduler: clock
+            )
+
+            coordinator.start()
+
+            try equal(coordinator.status.configurationLoadSource, .createdBlankProfile, "fresh creation source was hidden")
+            try expect(coordinator.status.activeProfile != nil, "fresh root did not expose its Active Profile")
+            try expect(!coordinator.status.configuration.automatic.isEnabled, "fresh root enabled Automation")
+            try expect(coordinator.status.configuration.rules.isEmpty, "fresh root synthesized hidden Rules")
+            try expect(clock.tasks.filter { !$0.cancelled }.isEmpty, "Automation-off startup scheduled hidden work")
+            let freshPersisted = try store.load().activeProfile
+            try expect(freshPersisted.rules.isEmpty, "fresh observation persisted hidden Rules")
+        }
+
+        runner.run("Active Profile persists across coordinator restart with generation status") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Office")
+            target.rules = [makeRule("inert", actions: [.init(target: .exact(builtIn), action: .noAction)])]
+            try value.configurationStore.saveProfile(target)
+            _ = try value.coordinator.activateProfile(id: target.id)
+
+            let restarted = try AutomationCoordinator(
+                configurationStore: value.configurationStore,
+                runtimeStateStore: value.stateStore,
+                adapter: FakeAdapter([display(1, builtIn, builtInFamily, builtIn: true, main: true)]),
+                scheduler: Clock()
+            )
+
+            try equal(restarted.status.activeProfile?.id, target.id, "restart selected a different Profile")
+            try equal(restarted.status.activeProfile?.name, "Office", "restart lost Active Profile data")
+            try equal(restarted.status.settingsGenerationSource, .primary, "settings generation source was not surfaced")
+            try equal(restarted.status.activeProfileGenerationSource, .primary, "Profile generation source was not surfaced")
+            try expect(restarted.status.isCatalogValid, "valid Profile catalog was reported invalid")
+        }
+
+        runner.run("manual activation is immediate while Automation-off clears pause and replaces polling") {
+            var initial = config([], automatic: true)
+            initial.polling = .init(isEnabled: true, intervalSeconds: 10)
+            let value = try fixture(
+                initial,
+                [
+                    display(1, builtIn, builtInFamily, builtIn: true, main: true),
+                    display(2, external1, externalFamily)
+                ]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            value.coordinator.start()
+            value.coordinator.pause()
+            var offTarget = try value.configurationStore.createBlankProfile(named: "Manual only")
+            offTarget.rules = [makeRule("disable built-in", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try value.configurationStore.saveProfile(offTarget)
+
+            let activation = try value.coordinator.activateProfile(id: offTarget.id)
+
+            try equal(activation.hardwareOutcome, .applied, "forced activation hardware result was not separated from selection")
+            try equal(value.adapter.transactions.last?.first?.action, .disable, "Automation-off activation did not evaluate immediately")
+            try expect(!value.coordinator.status.configuration.automatic.isEnabled, "forced activation persisted Automation-on")
+            try equal(value.coordinator.status.pauseReason, nil, "Profile activation did not clear pause")
+            try equal(try value.configurationStore.load().activeProfile.automatic.isEnabled, false, "forced activation rewrote target Automation")
+            try expect(value.clock.tasks.filter { !$0.cancelled && $0.interval != nil }.isEmpty, "old polling survived Automation-off activation")
+
+            var pollingTarget = try value.configurationStore.createBlankProfile(named: "Polling")
+            pollingTarget.automatic.isEnabled = true
+            pollingTarget.polling = .init(isEnabled: true, intervalSeconds: 2)
+            try value.configurationStore.saveProfile(pollingTarget)
+            _ = try value.coordinator.activateProfile(id: pollingTarget.id)
+            let repeating = value.clock.tasks.filter { !$0.cancelled }.compactMap(\.interval)
+            try equal(repeating, [2], "polling did not restart from the newly Active Profile")
+        }
+
+        runner.run("inactive Profile save is isolated from Active Profile and hardware") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let activeID = value.coordinator.status.activeProfile!.id
+            let activeBefore = value.coordinator.status.configuration
+            var inactive = try value.coordinator.createBlankProfile(named: "Draft")
+            inactive.automatic.isEnabled = true
+            inactive.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+
+            _ = try value.coordinator.saveProfile(inactive, applyImmediately: true)
+
+            try equal(value.coordinator.status.activeProfile?.id, activeID, "inactive save switched Active Profile")
+            try equal(value.coordinator.status.configuration, activeBefore, "inactive draft was written into Active Profile")
+            try expect(value.adapter.transactions.isEmpty, "inactive save had a hardware effect")
+            try equal(try value.configurationStore.loadProfile(id: inactive.id).profile.rules, inactive.rules, "inactive target was not saved")
+            try equal(try value.configurationStore.load().activeProfile.id, activeID, "inactive save changed persisted selector")
+        }
+
+        runner.run("activation persists identity before hardware failure and reports both outcomes") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 1
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Failing")
+            target.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try value.configurationStore.saveProfile(target)
+            var selectorSeenAtApply: UUID?
+            value.adapter.beforeTransactionObservation = { _ in
+                selectorSeenAtApply = try? value.configurationStore.load().activeProfile.id
+            }
+            value.adapter.failuresRemaining = 1
+
+            let result = try value.coordinator.activateProfile(id: target.id)
+
+            try equal(selectorSeenAtApply, target.id, "hardware application preceded Active Profile persistence")
+            try equal(result.activeProfile.id, target.id, "activation result lost persisted selection")
+            try equal(result.hardwareOutcome, .failed, "hardware failure was reported as activation failure")
+            try equal(value.coordinator.status.activeProfile?.id, target.id, "hardware failure rolled back Active Profile")
+            try equal(try value.configurationStore.load().activeProfile.id, target.id, "hardware failure rolled back durable selector")
+            try expect(result.actionDiagnostics.contains { $0.code == .actionFailed }, "hardware failure diagnostics were not attached to activation")
+        }
+
+        runner.run("activation keeps explicit disables and restores no-action or empty transitions") {
+            func makeOwnedFixture() throws -> Fixture {
+                var state = RuntimeState.empty(bootIdentifier: "boot")
+                state.appDisabledDisplays = [.init(runtimeID: 1, stableIdentity: builtIn, family: builtInFamily)]
+                return try fixture(
+                    config([], automatic: false),
+                    [
+                        display(1, builtIn, builtInFamily, builtIn: true, state: .notObserved),
+                        display(2, external1, externalFamily, main: true)
+                    ],
+                    state: state,
+                    attempts: 1
+                )
+            }
+
+            let keep = try makeOwnedFixture()
+            defer { try? FileManager.default.removeItem(at: keep.root) }
+            var disabling = try keep.configurationStore.createBlankProfile(named: "Keep disabled")
+            disabling.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try keep.configurationStore.saveProfile(disabling)
+            _ = try keep.coordinator.activateProfile(id: disabling.id)
+            try equal(keep.adapter.transactions.last?.first?.action, .disable, "explicit winning disable was replaced by transition restore")
+            try equal((try keep.stateStore.load().state).appDisabledDisplays.map(\.runtimeID), [1], "kept disable retired recovery evidence")
+
+            for (name, rules) in [
+                ("No action", [makeRule("none", actions: [.init(target: .exact(builtIn), action: .noAction)])]),
+                ("Empty", [])
+            ] {
+                let restore = try makeOwnedFixture()
+                defer { try? FileManager.default.removeItem(at: restore.root) }
+                var target = try restore.configurationStore.createBlankProfile(named: name)
+                target.rules = rules
+                try restore.configurationStore.saveProfile(target)
+                _ = try restore.coordinator.activateProfile(id: target.id)
+                try equal(restore.adapter.transactions.last?.first?.action, .enable, "\(name) Profile did not restore obsolete disable")
+                let state = try restore.stateStore.load().state
+                try expect(state.appDisabledDisplays.isEmpty && state.pendingDisableDisplays.isEmpty && state.pendingRecoveryDisplays.isEmpty, "\(name) restore did not retire confirmed evidence")
+            }
+        }
+
+        runner.run("activation retry reobserves and drops a stale transition restore") {
+            var state = RuntimeState.empty(bootIdentifier: "boot")
+            state.appDisabledDisplays = [.init(runtimeID: 1, stableIdentity: builtIn, family: builtInFamily)]
+            let value = try fixture(
+                config([], automatic: false),
+                [
+                    display(1, builtIn, builtInFamily, builtIn: true, state: .notObserved),
+                    display(2, external1, externalFamily, main: true)
+                ],
+                state: state,
+                attempts: 3
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let target = try value.configurationStore.createBlankProfile(named: "Empty")
+            value.adapter.failuresRemaining = 1
+            value.adapter.afterKnownFailure = { adapter in
+                adapter.setState(.online, runtimeID: 1)
+                adapter.afterKnownFailure = nil
+            }
+
+            _ = try value.coordinator.activateProfile(id: target.id)
+
+            try equal(value.adapter.transactions.count, 1, "retry reused a stale transition restore")
+            let reconciledState = try value.stateStore.load().state
+            try expect(reconciledState.appDisabledDisplays.isEmpty, "fresh online observation did not settle transition evidence")
+        }
+
+        runner.run("catalog reload surfaces disk state without applying external Active selector") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let liveID = value.coordinator.status.activeProfile!.id
+            let externalTarget = try value.configurationStore.createBlankProfile(named: "External edit")
+            _ = try value.configurationStore.activateProfile(id: externalTarget.id)
+            let invalidURL = value.configurationStore.profilesDirectoryURL.appendingPathComponent("invalid.json")
+            try Data("invalid".utf8).write(to: invalidURL)
+
+            let reloaded = value.coordinator.reloadProfileCatalog()
+
+            try equal(reloaded.activeProfile?.id, liveID, "catalog reload silently applied external Active selector")
+            try equal(reloaded.configuration, value.coordinator.status.configuration, "catalog reload replaced live configuration")
+            try equal(reloaded.externalActiveProfileID, externalTarget.id, "ignored external selector was not surfaced")
+            try expect(!reloaded.isCatalogValid && reloaded.profileCatalog.invalidProfiles.count == 1, "invalid catalog state was not surfaced")
+            try equal(try value.configurationStore.load().activeProfile.id, externalTarget.id, "test did not establish external selector change")
+            try expect(value.adapter.transactions.isEmpty, "catalog reload applied hardware actions")
+        }
+
+        runner.run("global Display History survives activation and implicit writes stay scoped") {
+            let extraFamily = DisplayFamily(vendorID: 400, modelID: 40)
+            let extraIdentity = StableDisplayIdentity(family: extraFamily, serialNumber: 41)
+            var initial = config([], automatic: false)
+            initial.deviceHistory = []
+            let value = try fixture(
+                initial,
+                [display(4, extraIdentity, extraFamily, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let activeID = value.coordinator.status.activeProfile!.id
+            let profileBefore = try Data(contentsOf: value.configurationStore.profileURL(for: activeID))
+            let target = try value.configurationStore.createBlankProfile(named: "Other")
+
+            value.coordinator.start()
+            let profileAfterHistory = try Data(contentsOf: value.configurationStore.profileURL(for: activeID))
+            try equal(profileAfterHistory, profileBefore, "implicit history write rewrote the Active Profile generation")
+            let persistedHistory = try value.configurationStore.load().configuration.deviceHistory
+            try expect(persistedHistory.contains { $0.target == .exact(extraIdentity) }, "implicit history was not persisted globally")
+            _ = try value.coordinator.activateProfile(id: target.id)
+            try expect(value.coordinator.status.configuration.deviceHistory.contains { $0.target == .exact(extraIdentity) }, "Profile activation lost global history")
+
+            let fallbackRoot = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-scoped-fallback-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: fallbackRoot) }
+            let fallbackStore = ConfigurationStore(rootURL: fallbackRoot, legacyDefaults: nil)
+            try fallbackStore.save(initial)
+            let fallbackID = try fallbackStore.load().activeProfile.id
+            let corrupt = Data("corrupt-profile-primary".utf8)
+            try corrupt.write(to: fallbackStore.profileURL(for: fallbackID))
+            let fallbackCoordinator = try AutomationCoordinator(
+                configurationStore: fallbackStore,
+                runtimeStateStore: RuntimeStateStore(rootURL: fallbackRoot, legacyDefaults: nil, bootIdentifierProvider: { "boot" }),
+                adapter: FakeAdapter([display(4, extraIdentity, extraFamily, main: true)]),
+                scheduler: Clock()
+            )
+            fallbackCoordinator.start()
+            try equal(fallbackCoordinator.status.settingsGenerationSource, .primary, "global generation source changed unexpectedly")
+            try equal(fallbackCoordinator.status.activeProfileGenerationSource, .lastKnownGoodBackup, "Profile fallback source was not surfaced")
+            try equal(try Data(contentsOf: fallbackStore.profileURL(for: fallbackID)), corrupt, "global implicit write repaired or rewrote Profile fallback")
+            let fallbackHistory = try fallbackStore.load().configuration.deviceHistory
+            try expect(fallbackHistory.contains { $0.target == .exact(extraIdentity) }, "Profile fallback blocked writable global history")
+        }
+
+        runner.run("Profile lifecycle APIs and invalid targets never disturb live runtime") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let activeID = value.coordinator.status.activeProfile!.id
+            let blank = try value.coordinator.createBlankProfile(named: "Blank")
+            let copy = try value.coordinator.duplicateProfile(id: blank.id, named: "Copy")
+            let renamed = try value.coordinator.renameProfile(id: copy.id, to: "Renamed")
+            try equal(renamed.name, "Renamed", "rename API did not return updated Profile")
+            try value.coordinator.deleteInactiveProfile(id: blank.id)
+            try expect(!value.coordinator.status.profileCatalog.profiles.contains { $0.id == blank.id }, "delete API left inactive Profile in catalog")
+
+            var missingRefused = false
+            do { _ = try value.coordinator.activateProfile(id: UUID()) } catch { missingRefused = true }
+            try expect(missingRefused, "missing activation target was accepted")
+
+            try Data("invalid".utf8).write(to: value.configurationStore.profileURL(for: renamed.id))
+            try Data("invalid".utf8).write(to: value.configurationStore.profileBackupURL(for: renamed.id))
+            var invalidRefused = false
+            do { _ = try value.coordinator.activateProfile(id: renamed.id) } catch { invalidRefused = true }
+            try expect(invalidRefused, "invalid activation target was accepted")
+            try equal(value.coordinator.status.activeProfile?.id, activeID, "refused target changed live Active Profile")
+            try equal(try value.configurationStore.load().activeProfile.id, activeID, "refused target changed durable selector")
+            try expect(value.adapter.transactions.isEmpty, "refused target reached hardware")
+        }
+
+        runner.run("compatibility save writes only changed persistence domains") {
+            let fallbackRoot = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-explicit-scope-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: fallbackRoot) }
+            let fallbackStore = ConfigurationStore(rootURL: fallbackRoot, legacyDefaults: nil)
+            let initial = config([], automatic: false)
+            try fallbackStore.save(initial)
+            let fallbackID = try fallbackStore.load().activeProfile.id
+            let corruptProfile = Data("corrupt-active-primary".utf8)
+            try corruptProfile.write(to: fallbackStore.profileURL(for: fallbackID))
+            let fallbackCoordinator = try AutomationCoordinator(
+                configurationStore: fallbackStore,
+                runtimeStateStore: RuntimeStateStore(rootURL: fallbackRoot, legacyDefaults: nil, bootIdentifierProvider: { "boot" }),
+                adapter: FakeAdapter([]),
+                scheduler: Clock()
+            )
+            var settingsOnly = fallbackCoordinator.status.configuration
+            settingsOnly.hotKey = .init(keyCode: 9, modifiers: 456)
+
+            _ = try fallbackCoordinator.updateConfiguration(settingsOnly, applyImmediately: false)
+
+            let profilePrimaryAfterSettings = try Data(contentsOf: fallbackStore.profileURL(for: fallbackID))
+            try equal(profilePrimaryAfterSettings, corruptProfile, "settings-only save rewrote fallback Profile primary")
+            try equal(fallbackCoordinator.status.activeProfileGenerationSource, .lastKnownGoodBackup, "settings-only save repaired unrelated Profile fallback")
+
+            let profileOnly = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: profileOnly.root) }
+            let settingsBefore = try Data(contentsOf: profileOnly.configurationStore.configurationURL)
+            var profileCandidate = profileOnly.coordinator.status.configuration
+            profileCandidate.polling.intervalSeconds = 17
+
+            _ = try profileOnly.coordinator.updateConfiguration(profileCandidate, applyImmediately: false)
+
+            let settingsAfter = try Data(contentsOf: profileOnly.configurationStore.configurationURL)
+            try equal(settingsAfter, settingsBefore, "Profile-only save rewrote Application Settings")
+            try equal(try profileOnly.configurationStore.load().configuration.polling.intervalSeconds, 17, "Profile-only save did not persist target Profile")
+        }
+
+        runner.run("stale fingerprint exhaustion reports failed or partial with settled actions") {
+            func toggleExtraDisplay(_ adapter: FakeAdapter) {
+                if adapter.live[3] == nil {
+                    adapter.add(display(3, external2, externalFamily))
+                } else {
+                    adapter.setState(nil, runtimeID: 3)
+                }
+            }
+
+            let exhausted = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 2
+            )
+            defer { try? FileManager.default.removeItem(at: exhausted.root) }
+            var staleTarget = try exhausted.configurationStore.createBlankProfile(named: "Always stale")
+            staleTarget.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try exhausted.configurationStore.saveProfile(staleTarget)
+            exhausted.adapter.beforeTransactionObservation = toggleExtraDisplay
+
+            let failed = try exhausted.coordinator.activateProfile(id: staleTarget.id)
+
+            try equal(failed.hardwareOutcome, .failed, "exhausted stale plans were reported applied")
+            try expect(failed.actionDiagnostics.contains { $0.code == .actionFailed && $0.message.contains("every retry") }, "stale exhaustion diagnostic missing")
+            try expect(exhausted.adapter.transactions.isEmpty, "stale fingerprint reached hardware commit")
+
+            let partial = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 3
+            )
+            defer { try? FileManager.default.removeItem(at: partial.root) }
+            var mixedTarget = try partial.configurationStore.createBlankProfile(named: "Partial stale")
+            mixedTarget.rules = [makeRule("mixed", actions: [
+                .init(target: .exact(builtIn), action: .disable),
+                .init(target: .exact(external1), action: .enable)
+            ])]
+            try partial.configurationStore.saveProfile(mixedTarget)
+            partial.adapter.failedEnableIDs = [2]
+            var firstCommitted = false
+            partial.adapter.afterCommit = { _, _ in firstCommitted = true }
+            partial.adapter.beforeTransactionObservation = { adapter in
+                if firstCommitted { toggleExtraDisplay(adapter) }
+            }
+
+            let partiallyFailed = try partial.coordinator.activateProfile(id: mixedTarget.id)
+
+            try equal(partiallyFailed.hardwareOutcome, .partiallyFailed, "settled action was lost during stale exhaustion")
+            try equal(partial.adapter.transactions.count, 1, "settled disable was reapplied during stale retries")
+        }
+
+        runner.run("post-commit refresh failure preserves applied activation result") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 1
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Committed")
+            target.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try value.configurationStore.saveProfile(target)
+            value.adapter.failCoordinatorRefreshAfterApply = true
+
+            let result = try value.coordinator.activateProfile(id: target.id)
+
+            try equal(result.hardwareOutcome, .applied, "final refresh failure erased confirmed hardware success")
+            try expect(result.actionDiagnostics.contains { $0.message.contains("final inventory refresh failed") }, "post-commit refresh diagnostic missing")
+            try equal(value.adapter.transactions.count, 1, "confirmed action was not committed")
+        }
+
+        runner.run("Active Profile save and rename repair fallback runtime state") {
+            func fallbackCoordinator(named suffix: String) throws -> (URL, ConfigurationStore, AutomationCoordinator) {
+                let root = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-fallback-repair-\(suffix)-\(UUID().uuidString)")
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(config([], automatic: false))
+                let id = try store.load().activeProfile.id
+                try Data("corrupt".utf8).write(to: store.profileURL(for: id))
+                let coordinator = try AutomationCoordinator(
+                    configurationStore: store,
+                    runtimeStateStore: RuntimeStateStore(rootURL: root, legacyDefaults: nil, bootIdentifierProvider: { "boot" }),
+                    adapter: FakeAdapter([]),
+                    scheduler: Clock()
+                )
+                return (root, store, coordinator)
+            }
+
+            let saved = try fallbackCoordinator(named: "save")
+            defer { try? FileManager.default.removeItem(at: saved.0) }
+            try equal(saved.2.status.activeProfileGenerationSource, .lastKnownGoodBackup, "fallback setup did not load backup")
+            _ = try saved.2.saveProfile(saved.2.status.activeProfile!, applyImmediately: false)
+            try equal(saved.2.status.activeProfileGenerationSource, .primary, "Active save did not repair Profile source")
+            try equal(saved.2.status.configurationLoadSource, .primary, "Active save left overall fallback source")
+            try expect(!saved.2.status.diagnostics.contains { $0.code == .configurationFallback }, "Active save left fallback diagnostic")
+            try expect(saved.2.status.persistenceErrorDescription == nil, "Active save left fallback error")
+
+            let renamed = try fallbackCoordinator(named: "rename")
+            defer { try? FileManager.default.removeItem(at: renamed.0) }
+            let renamedProfile = try renamed.2.renameProfile(id: renamed.2.status.activeProfile!.id, to: "Repaired")
+            try equal(renamed.2.status.activeProfileGenerationSource, .primary, "Active rename did not repair Profile source")
+            try equal(renamed.2.status.configurationLoadSource, .primary, "Active rename left overall fallback source")
+            try expect(!renamed.2.status.diagnostics.contains { $0.code == .configurationFallback }, "Active rename left fallback diagnostic")
+            var editable = renamedProfile
+            editable.polling.intervalSeconds = 19
+            _ = try renamed.2.saveProfile(editable, applyImmediately: false)
+            try equal(try renamed.1.load().activeProfile.polling.intervalSeconds, 19, "rename repair left Active Profile unwritable")
+        }
+
+        runner.run("cycle-disabled activation result and catalog use persisted Profile") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 1
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Cycle")
+            target.rules = [
+                makeRule(
+                    "disable external",
+                    conditions: [.exactState(identity: external1, state: .online)],
+                    actions: [.init(target: .exact(external1), action: .disable)]
+                ),
+                makeRule(
+                    "enable external",
+                    conditions: [.exactState(identity: external1, state: .disabledByThisAppConnectionUnknown)],
+                    actions: [.init(target: .exact(external1), action: .enable)]
+                )
+            ]
+            try value.configurationStore.saveProfile(target)
+
+            let result = try value.coordinator.activateProfile(id: target.id)
+
+            try expect(result.activeProfile.rules.allSatisfy { !$0.isEnabled }, "activation result exposed pre-cycle Profile")
+            try expect(result.preview.profile.rules.allSatisfy { !$0.isEnabled }, "activation preview data exposed pre-cycle Profile")
+            let persisted = try value.configurationStore.load().activeProfile
+            try equal(result.activeProfile, persisted, "activation result diverged from persisted cycle-disabled Profile")
+            try equal(value.coordinator.status.profileCatalog.profiles.first { $0.id == target.id }, persisted, "catalog was not refreshed after cycle persistence")
+        }
+
+        runner.run("last-good restore repairs inactive and Active Profiles without applying") {
+            let inactive = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: inactive.root) }
+            let activeID = inactive.coordinator.status.activeProfile!.id
+            let activeConfiguration = inactive.coordinator.status.configuration
+            let inactiveProfile = try inactive.coordinator.createBlankProfile(named: "Recover me")
+            try Data("corrupt-inactive".utf8).write(to: inactive.configurationStore.profileURL(for: inactiveProfile.id))
+
+            let restoredInactive = try inactive.coordinator.restoreProfileFromLastKnownGood(id: inactiveProfile.id)
+
+            try equal(restoredInactive, inactiveProfile, "inactive restore changed backup content")
+            try equal(inactive.coordinator.status.activeProfile?.id, activeID, "inactive restore changed Active selector")
+            try equal(inactive.coordinator.status.configuration, activeConfiguration, "inactive restore changed live configuration")
+            try expect(inactive.adapter.transactions.isEmpty, "inactive restore applied hardware")
+            try equal(inactive.coordinator.status.profileCatalog.profiles.first { $0.id == inactiveProfile.id }, inactiveProfile, "inactive restore did not refresh catalog")
+
+            let activeRoot = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-active-restore-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: activeRoot) }
+            let activeStore = ConfigurationStore(rootURL: activeRoot, legacyDefaults: nil)
+            try activeStore.save(config([], automatic: false))
+            let fallbackProfile = try activeStore.load().activeProfile
+            try Data("corrupt-active".utf8).write(to: activeStore.profileURL(for: fallbackProfile.id))
+            let activeAdapter = FakeAdapter([display(1, builtIn, builtInFamily, builtIn: true, main: true)])
+            let activeCoordinator = try AutomationCoordinator(
+                configurationStore: activeStore,
+                runtimeStateStore: RuntimeStateStore(rootURL: activeRoot, legacyDefaults: nil, bootIdentifierProvider: { "boot" }),
+                adapter: activeAdapter,
+                scheduler: Clock()
+            )
+
+            _ = try activeCoordinator.restoreProfileFromLastKnownGood(id: fallbackProfile.id)
+
+            try equal(activeCoordinator.status.activeProfileGenerationSource, .primary, "Active restore left fallback Profile source")
+            try equal(activeCoordinator.status.configurationLoadSource, .primary, "Active restore left overall fallback source")
+            try expect(!activeCoordinator.status.diagnostics.contains { $0.code == .configurationFallback }, "Active restore left fallback diagnostic")
+            try expect(activeCoordinator.status.persistenceErrorDescription == nil, "Active restore left fallback error")
+            try equal(try activeStore.load().activeProfile.id, fallbackProfile.id, "Active restore changed durable selector")
+            try expect(activeAdapter.transactions.isEmpty, "Active restore applied hardware")
+        }
+
+        runner.run("invalid Profile removal refreshes catalog without selector or hardware changes") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let activeID = value.coordinator.status.activeProfile!.id
+            let invalidFileName = "remove-me.json"
+            try Data("invalid".utf8).write(
+                to: value.configurationStore.profilesDirectoryURL.appendingPathComponent(invalidFileName)
+            )
+            _ = value.coordinator.reloadProfileCatalog()
+            try expect(value.coordinator.status.profileCatalog.invalidProfiles.contains { $0.fileName == invalidFileName }, "invalid setup was not cataloged")
+
+            let status = try value.coordinator.removeInvalidProfile(fileName: invalidFileName)
+
+            try expect(!status.profileCatalog.invalidProfiles.contains { $0.fileName == invalidFileName }, "invalid removal did not refresh catalog")
+            try equal(status.activeProfile?.id, activeID, "invalid removal changed Active selector")
+            try equal(try value.configurationStore.load().activeProfile.id, activeID, "invalid removal changed durable selector")
+            try expect(value.adapter.transactions.isEmpty, "invalid removal applied hardware")
+        }
+
+        runner.run("catalog reload flags same-ID external Active Profile content changes") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let activeID = value.coordinator.status.activeProfile!.id
+            let livePolling = value.coordinator.status.configuration.polling.intervalSeconds
+            var externalEdit = try value.configurationStore.load().activeProfile
+            externalEdit.polling.intervalSeconds = 23
+            try value.configurationStore.saveProfile(externalEdit)
+
+            let status = value.coordinator.reloadProfileCatalog()
+
+            try equal(status.externalActiveProfileID, activeID, "same-ID external content change was not flagged")
+            try equal(status.activeProfile?.id, activeID, "same-ID reload changed Active identity")
+            try equal(status.configuration.polling.intervalSeconds, livePolling, "same-ID reload silently applied external Profile content")
+            try expect(value.adapter.transactions.isEmpty, "same-ID reload applied hardware")
+        }
+
+        runner.run("activation preview nil observation reads fresh topology") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Fresh preview")
+            target.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try value.configurationStore.saveProfile(target)
+            try expect(value.coordinator.status.inventory.displays.isEmpty, "preview test unexpectedly had cached inventory")
+
+            let preview = try value.coordinator.previewProfileActivation(id: target.id, observation: nil)
+
+            try equal(value.adapter.observationCount, 1, "nil activation preview did not make one fresh read-only observation")
+            try expect(!preview.evaluation.winningActions.isEmpty, "fresh preview reused empty cached inventory")
+            try expect(preview.policyFingerprint != DisplayPolicySnapshotFingerprint(snapshot: .init(displays: [])), "fresh preview returned empty cached fingerprint")
+            try expect(value.adapter.transactions.isEmpty, "read-only preview applied hardware")
+        }
+
+        runner.run("guarded activation refuses topology drift before selector or hardware") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let oldID = value.coordinator.status.activeProfile!.id
+            let target = try value.configurationStore.createBlankProfile(named: "Topology token")
+            let preview = try value.coordinator.previewProfileActivation(id: target.id, observation: nil)
+            value.adapter.add(display(3, external2, externalFamily))
+            var refused = false
+
+            do {
+                _ = try value.coordinator.activateProfile(id: target.id, confirmedPreview: preview)
+            } catch AutomationCoordinatorError.staleProfileActivationPreview {
+                refused = true
+            }
+
+            try expect(refused, "guarded activation accepted changed topology")
+            try equal(value.coordinator.status.activeProfile?.id, oldID, "topology-stale activation changed live selector")
+            try equal(try value.configurationStore.load().activeProfile.id, oldID, "topology-stale activation changed durable selector")
+            try expect(value.adapter.transactions.isEmpty, "topology-stale activation reached hardware")
+        }
+
+        runner.run("guarded activation refuses target disk drift before selector or hardware") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let oldID = value.coordinator.status.activeProfile!.id
+            var target = try value.configurationStore.createBlankProfile(named: "Disk token")
+            let preview = try value.coordinator.previewProfileActivation(id: target.id, observation: nil)
+            target.polling.intervalSeconds = 27
+            try value.configurationStore.saveProfile(target)
+            var refused = false
+
+            do {
+                _ = try value.coordinator.activateProfile(id: target.id, confirmedPreview: preview)
+            } catch AutomationCoordinatorError.staleProfileActivationPreview {
+                refused = true
+            }
+
+            try expect(refused, "guarded activation accepted changed target Profile")
+            try equal(value.coordinator.status.activeProfile?.id, oldID, "disk-stale activation changed live selector")
+            try equal(try value.configurationStore.load().activeProfile.id, oldID, "disk-stale activation changed durable selector")
+            try expect(value.adapter.transactions.isEmpty, "disk-stale activation reached hardware")
+        }
+
+        runner.run("guarded activation refuses generation-source fallback drift") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let oldID = value.coordinator.status.activeProfile!.id
+            let target = try value.configurationStore.createBlankProfile(named: "Source token")
+            let preview = try value.coordinator.previewProfileActivation(id: target.id, observation: nil)
+            try equal(preview.profileSource, .primary, "source-drift setup did not preview primary")
+            try Data("corrupt-primary".utf8).write(to: value.configurationStore.profileURL(for: target.id))
+            var refused = false
+
+            do {
+                _ = try value.coordinator.activateProfile(id: target.id, confirmedPreview: preview)
+            } catch AutomationCoordinatorError.staleProfileActivationPreview {
+                refused = true
+            }
+
+            try expect(refused, "guarded activation accepted an unconfirmed backup fallback")
+            try equal(value.coordinator.status.activeProfile?.id, oldID, "source-stale activation changed live selector")
+            try equal(try value.configurationStore.load().activeProfile.id, oldID, "source-stale activation changed durable selector")
+            try expect(value.adapter.transactions.isEmpty, "source-stale activation reached hardware")
+        }
+
+        runner.run("guarded activation stops post-selector topology and Profile drift") {
+            let topology = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)]
+            )
+            defer { try? FileManager.default.removeItem(at: topology.root) }
+            var topologyTarget = try topology.configurationStore.createBlankProfile(named: "Post selector topology")
+            topologyTarget.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try topology.configurationStore.saveProfile(topologyTarget)
+            let topologyPreview = try topology.coordinator.previewProfileActivation(id: topologyTarget.id, observation: nil)
+            topology.adapter.afterObservation = { adapter, count in
+                if count == 2 { adapter.add(display(3, external2, externalFamily)) }
+            }
+
+            let topologyResult = try topology.coordinator.activateProfile(
+                id: topologyTarget.id,
+                confirmedPreview: topologyPreview
+            )
+
+            try equal(topologyResult.hardwareOutcome, .failed, "post-selector topology drift was not stale")
+            try equal(try topology.configurationStore.load().activeProfile.id, topologyTarget.id, "stale hardware check rolled back selector")
+            try expect(topology.adapter.transactions.isEmpty, "post-selector topology drift reached hardware")
+
+            let profile = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)]
+            )
+            defer { try? FileManager.default.removeItem(at: profile.root) }
+            var profileTarget = try profile.configurationStore.createBlankProfile(named: "Post selector Profile")
+            profileTarget.rules = [makeRule("disable", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try profile.configurationStore.saveProfile(profileTarget)
+            let profilePreview = try profile.coordinator.previewProfileActivation(id: profileTarget.id, observation: nil)
+            profile.adapter.afterObservation = { _, count in
+                guard count == 3 else { return }
+                profileTarget.polling.intervalSeconds = 29
+                try? profile.configurationStore.saveProfile(profileTarget)
+            }
+
+            let profileResult = try profile.coordinator.activateProfile(
+                id: profileTarget.id,
+                confirmedPreview: profilePreview
+            )
+
+            try equal(profileResult.hardwareOutcome, .failed, "post-selector Profile drift was not stale")
+            try equal(try profile.configurationStore.load().activeProfile.id, profileTarget.id, "Profile-stale hardware check rolled back selector")
+            try expect(profile.adapter.transactions.isEmpty, "post-selector Profile drift reached hardware")
+        }
+
+        runner.run("guarded retries never introduce unconfirmed action intents") {
+            let conditional = makeRule(
+                "new disable",
+                conditions: [.count(.init(kind: .online, scope: .external, comparison: .greaterThan, value: 1))],
+                actions: [.init(target: .exact(builtIn), action: .disable)]
+            )
+            let confirmed = makeRule("confirmed disable", actions: [.init(target: .exact(external1), action: .disable)])
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 3
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Intent envelope")
+            target.rules = [confirmed, conditional]
+            try value.configurationStore.saveProfile(target)
+            let preview = try value.coordinator.previewProfileActivation(id: target.id, observation: nil)
+            try expect(!preview.evaluation.winningActions.contains { $0.display.runtimeID == 1 }, "unconfirmed intent existed in preview")
+            value.adapter.beforeTransactionObservation = { adapter in
+                adapter.add(display(3, external2, externalFamily))
+                adapter.beforeTransactionObservation = nil
+            }
+
+            _ = try value.coordinator.activateProfile(id: target.id, confirmedPreview: preview)
+
+            try equal(value.adapter.transactions.count, 1, "confirmed action did not settle after stale binding")
+            try expect(value.adapter.transactions[0].allSatisfy { $0.display.runtimeID == 2 }, "retry introduced an action absent from confirmed preview")
+        }
+
+        runner.run("hotkey-only legacy migration stays rule-empty") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-hotkey-migration-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let suite = "display-steward-hotkey-only-\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.set(9, forKey: "hotKeyKeyCode")
+            let store = ConfigurationStore(rootURL: root, legacyDefaults: defaults)
+            let clock = Clock()
+            let adapter = FakeAdapter([
+                display(1, builtIn, builtInFamily, builtIn: true, main: true),
+                display(2, external1, externalFamily)
+            ])
+            let coordinator = try AutomationCoordinator(
+                configurationStore: store,
+                runtimeStateStore: RuntimeStateStore(rootURL: root, legacyDefaults: defaults, bootIdentifierProvider: { "boot" }),
+                adapter: adapter,
+                scheduler: clock
+            )
+
+            coordinator.start(); clock.advance(3)
+
+            try equal(coordinator.status.configurationLoadSource, .migratedLegacyDefaults, "legacy migration source was not retained")
+            try expect(coordinator.status.configuration.rules.isEmpty, "hotkey-only migration synthesized Rules")
+            let migratedProfile = try store.load().activeProfile
+            try expect(migratedProfile.rules.isEmpty, "hotkey-only migration persisted synthesized Rules")
+            try expect(adapter.transactions.isEmpty, "hotkey-only migration applied hidden display policy")
+        }
+
+        runner.run("Profile-only startup failure preserves writable global settings") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-settings-only-startup-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+            var initial = config([], automatic: true)
+            initial.hotKey = .init(keyCode: 8, modifiers: 456)
+            initial.deviceHistory = [.init(target: .exact(absent), name: "Remembered", isBuiltIn: false)]
+            try store.save(initial)
+            let brokenID = try store.load().activeProfile.id
+            try Data("bad-primary".utf8).write(to: store.profileURL(for: brokenID))
+            try Data("bad-backup".utf8).write(to: store.profileBackupURL(for: brokenID))
+            let coordinator = try AutomationCoordinator(
+                configurationStore: store,
+                runtimeStateStore: RuntimeStateStore(rootURL: root, legacyDefaults: nil, bootIdentifierProvider: { "boot" }),
+                adapter: FakeAdapter([]),
+                scheduler: Clock()
+            )
+
+            try equal(coordinator.status.configuration.hotKey, initial.hotKey, "Profile failure replaced global hotkey")
+            try equal(coordinator.status.configuration.deviceHistory, initial.deviceHistory, "Profile failure replaced Display History")
+            try expect(!coordinator.status.configuration.automatic.isEnabled, "Profile failure left Automation enabled")
+            try expect(coordinator.status.activeProfile == nil, "unusable Active Profile was presented as live")
+            try equal(coordinator.status.settingsGenerationSource, .primary, "settings writability/source was lost")
+
+            let replacement = try store.createBlankProfile(named: "Replacement")
+            _ = try coordinator.activateProfile(id: replacement.id)
+            try equal(coordinator.status.configuration.hotKey, initial.hotKey, "valid activation did not reuse retained globals")
+            try equal(coordinator.status.configuration.deviceHistory, initial.deviceHistory, "valid activation lost retained history")
+        }
+
+        runner.run("settings-only writes preserve external durable selector") {
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)]
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            let liveID = value.coordinator.status.activeProfile!.id
+            let external = try value.configurationStore.createBlankProfile(named: "Durable external")
+            _ = try value.configurationStore.activateProfile(id: external.id)
+            _ = value.coordinator.reloadProfileCatalog()
+            var globalEdit = value.coordinator.status.configuration
+            globalEdit.hotKey = .init(keyCode: 7, modifiers: 456)
+            globalEdit.deviceHistory.append(.init(target: .exact(absent), name: "Alias", isBuiltIn: false))
+
+            _ = try value.coordinator.updateConfiguration(globalEdit, applyImmediately: false)
+
+            try equal(try value.configurationStore.load().activeProfile.id, external.id, "settings-only write erased external selector")
+            try equal(value.coordinator.status.activeProfile?.id, liveID, "settings-only write applied external selector")
+            try equal(value.coordinator.status.configuration.hotKey, globalEdit.hotKey, "settings-only hotkey was not retained live")
+        }
+
+        runner.run("activation outcomes report evaluator safety blocks") {
+            let blocked = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true)],
+                attempts: 1
+            )
+            defer { try? FileManager.default.removeItem(at: blocked.root) }
+            var blockedTarget = try blocked.configurationStore.createBlankProfile(named: "All blocked")
+            blockedTarget.rules = [makeRule("disable last", actions: [.init(target: .exact(builtIn), action: .disable)])]
+            try blocked.configurationStore.saveProfile(blockedTarget)
+
+            let blockedResult = try blocked.coordinator.activateProfile(id: blockedTarget.id)
+
+            try equal(blockedResult.hardwareOutcome, .blockedBySafety, "all safety-blocked work was reported not-needed")
+            try expect(blockedResult.actionDiagnostics.contains { $0.code == .safetyRecovery }, "all-blocked safety diagnostic missing")
+            try expect(blocked.adapter.transactions.isEmpty, "all-blocked plan reached hardware")
+
+            let mixed = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 1
+            )
+            defer { try? FileManager.default.removeItem(at: mixed.root) }
+            var mixedTarget = try mixed.configurationStore.createBlankProfile(named: "Partially blocked")
+            mixedTarget.rules = [makeRule("disable all", actions: [
+                .init(target: .exact(builtIn), action: .disable),
+                .init(target: .exact(external1), action: .disable)
+            ])]
+            try mixed.configurationStore.saveProfile(mixedTarget)
+
+            let mixedResult = try mixed.coordinator.activateProfile(id: mixedTarget.id)
+
+            try equal(mixedResult.hardwareOutcome, .partiallyFailed, "mixed safety block was reported fully applied")
+            try expect(mixedResult.actionDiagnostics.contains { $0.code == .safetyRecovery }, "mixed safety diagnostic missing")
+            try equal(mixed.adapter.transactions.first?.map { $0.display.runtimeID }, [2], "mixed plan did not apply only unblocked action")
+        }
+
+        runner.run("explicit reload surfaces settings fallback unreadable and global drift") {
+            let fallback = try fixture(config([], automatic: false), [])
+            defer { try? FileManager.default.removeItem(at: fallback.root) }
+            try Data("bad-settings-primary".utf8).write(to: fallback.configurationStore.configurationURL)
+
+            let fallbackStatus = fallback.coordinator.reloadProfileCatalog()
+
+            try equal(fallbackStatus.externalSettingsGenerationSource, .lastKnownGoodBackup, "settings fallback source was suppressed")
+            try expect(fallbackStatus.externalSettingsErrorDescription != nil, "settings primary fallback error was suppressed")
+            try expect(fallbackStatus.externalApplicationSettings == nil, "matching fallback settings were reported as content drift")
+
+            try Data("bad-settings-backup".utf8).write(to: fallback.configurationStore.backupURL)
+            let unreadableStatus = fallback.coordinator.reloadProfileCatalog()
+            try expect(unreadableStatus.externalSettingsGenerationSource == nil, "unreadable settings retained stale source")
+            try expect(unreadableStatus.externalSettingsErrorDescription != nil, "unreadable settings error was suppressed")
+
+            let drift = try fixture(config([], automatic: false), [])
+            defer { try? FileManager.default.removeItem(at: drift.root) }
+            var externalSettings = try drift.configurationStore.loadApplicationSettings().settings
+            externalSettings.hotKey = .init(keyCode: 6, modifiers: 456)
+            externalSettings.deviceHistory.append(.init(target: .exact(absent), name: "External", isBuiltIn: false))
+            try drift.configurationStore.saveApplicationSettings(externalSettings)
+
+            let driftStatus = drift.coordinator.reloadProfileCatalog()
+
+            try equal(driftStatus.externalApplicationSettings, externalSettings, "external global settings drift was not surfaced")
+            try equal(driftStatus.externalSettingsGenerationSource, .primary, "external global settings source was wrong")
+            try expect(driftStatus.externalSettingsErrorDescription == nil, "clean external settings reported an error")
+            try expect(drift.adapter.transactions.isEmpty, "explicit settings reload applied hardware")
+        }
+
+        runner.run("guarded retry restores newly obsolete confirmed disable") {
+            let disable = makeRule(
+                "disable while active",
+                conditions: [.exactState(identity: builtIn, state: .active)],
+                actions: [.init(target: .exact(builtIn), action: .disable)]
+            )
+            let failing = makeRule(
+                "failing peer",
+                actions: [.init(target: .exact(external1), action: .enable)]
+            )
+            let value = try fixture(
+                config([], automatic: false),
+                [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)],
+                attempts: 3
+            )
+            defer { try? FileManager.default.removeItem(at: value.root) }
+            var target = try value.configurationStore.createBlankProfile(named: "Retry reconciliation")
+            target.rules = [disable, failing]
+            try value.configurationStore.saveProfile(target)
+            let preview = try value.coordinator.previewProfileActivation(id: target.id, observation: nil)
+            value.adapter.failedEnableIDs = [2]
+
+            let result = try value.coordinator.activateProfile(id: target.id, confirmedPreview: preview)
+
+            try equal(result.hardwareOutcome, .partiallyFailed, "peer failure erased settled disable/restore outcome")
+            try expect(value.adapter.transactions.count >= 2, "retry did not execute transition reconciliation")
+            try expect(value.adapter.transactions[1].contains { $0.display.runtimeID == 1 && $0.action == .enable }, "confirmed disable was stranded by intent filtering")
+            let settled = try value.stateStore.load().state
+            try expect(!settled.appDisabledDisplays.contains { $0.runtimeID == 1 }, "restored display retained app-owned disable evidence")
+            try expect(!settled.pendingDisableDisplays.contains { $0.runtimeID == 1 }, "restored display retained pending disable evidence")
+            try expect(!settled.pendingRecoveryDisplays.contains { $0.runtimeID == 1 }, "restored display retained recovery evidence")
         }
 
         runner.finish()

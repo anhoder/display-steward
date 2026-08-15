@@ -41,6 +41,7 @@ private let builtInFamily = DisplayFamily(vendorID: 100, modelID: 10)
 private let externalFamily = DisplayFamily(vendorID: 200, modelID: 20)
 private let builtInIdentity = StableDisplayIdentity(family: builtInFamily, serialNumber: 1)
 private let externalIdentity = StableDisplayIdentity(family: externalFamily, serialNumber: 2)
+private let secondaryExternalIdentity = StableDisplayIdentity(family: externalFamily, serialNumber: 3)
 
 private func display(
     runtimeID: UInt32,
@@ -148,8 +149,9 @@ private final class IntegrationAdapter: DisplayRuntimeAdapting {
     private var liveStates: [UInt32: ObservableDisplayState]
     private(set) var observeCount = 0
     private(set) var transactions: [[DisplayActionRequest]] = []
+    private let failingRuntimeIDs: Set<UInt32>
 
-    init(displays: [ObservedDisplay]) {
+    init(displays: [ObservedDisplay], failingRuntimeIDs: Set<UInt32> = []) {
         templates = Dictionary(uniqueKeysWithValues: displays.compactMap { item in
             item.runtimeID.map { ($0, item) }
         })
@@ -157,6 +159,12 @@ private final class IntegrationAdapter: DisplayRuntimeAdapting {
             guard let runtimeID = item.runtimeID, item.state.isOnline else { return nil }
             return (runtimeID, item.state)
         })
+        self.failingRuntimeIDs = failingRuntimeIDs
+    }
+    func add(_ item: ObservedDisplay) {
+        guard let runtimeID = item.runtimeID else { return }
+        templates[runtimeID] = item
+        if item.state.isOnline { liveStates[runtimeID] = item.state }
     }
 
     func observe(
@@ -218,6 +226,14 @@ private final class IntegrationAdapter: DisplayRuntimeAdapting {
         transactions.append(requests)
         var changed = false
         let results = requests.map { request -> DisplayActionResult in
+            if failingRuntimeIDs.contains(request.display.runtimeID) {
+                return DisplayActionResult(
+                    request: request,
+                    succeeded: false,
+                    wasIdempotent: false,
+                    errorDescription: "injected display failure"
+                )
+            }
             switch request.action {
             case .noAction:
                 return DisplayActionResult(
@@ -527,7 +543,7 @@ private enum Phase4IntegrationTests {
             }
         }
 
-        runner.run("overview displays rules and menu presentation share current configuration") {
+        runner.run("Profile settings displays rules and menu presentation share current configuration") {
             try withTemporaryDirectory { root in
                 let configurationStore = ConfigurationStore(rootURL: root, legacyDefaults: nil)
                 try configurationStore.save(stableConfiguration())
@@ -538,23 +554,22 @@ private enum Phase4IntegrationTests {
                 let runtime = try coordinator(root: root, adapter: adapter)
                 _ = try runtime.refresh()
 
-                let rules = RulesEditorViewModel(runtime: runtime)
-                rules.updateSelectedRule { $0.name = "规则页面更新" }
-                let overview = OverviewViewModel(runtime: runtime)
-                _ = try overview.setPollingInterval(41)
+                let profiles = ProfileManagementViewModel(runtime: runtime)
+                profiles.updateSelectedRule { $0.name = "规则页面更新" }
+                profiles.setPollingInterval(41)
+                profiles.setAutomaticEnabled(true)
                 let displays = DisplaysViewModel(runtime: runtime)
                 guard let externalRow = displays.rows.first(where: { $0.runtimeID == 2 }) else {
                     throw Failure(description: "external display row missing")
                 }
                 _ = try displays.setAlias("演示屏", for: externalRow.id)
-                _ = try rules.saveAndApply()
-                _ = try overview.setAutomaticEnabled(true)
+                _ = try profiles.saveSelectedProfile()
 
                 let status = runtime.status
-                try equal(status.configuration.polling.intervalSeconds, 41, "rule save overwrote overview polling update")
+                try equal(status.configuration.polling.intervalSeconds, 41, "rule save overwrote settings polling update")
                 try equal(status.configuration.deviceHistory.first(where: { $0.target == .exact(externalIdentity) })?.alias, "演示屏", "rule save overwrote display alias")
                 try equal(status.configuration.rules.first?.name, "规则页面更新", "later status update overwrote rule draft")
-                try expect(status.configuration.automatic.isEnabled, "overview automatic update was lost")
+                try expect(status.configuration.automatic.isEnabled, "settings automatic update was lost")
                 let menu = PresentationText.menu(status: status)
                 try expect(menu.automaticEnabled, "menu presentation saw a different configuration")
                 try equal(menu.displays.first(where: { $0.runtimeID == 2 })?.title, "演示屏", "menu presentation missed display update")
@@ -592,9 +607,346 @@ private enum Phase4IntegrationTests {
                 try expect(logs.contains { $0.contains("transaction attempt=1/1") && $0.contains("committed=true") && $0.contains("success=[1:disable]") && $0.contains("failure=[]") && $0.contains("afterActive=1") }, "transaction outcome summary omitted commit, result, or postcondition")
                 let status = runtime.status
                 try equal(status.inventory.displays.first(where: { $0.runtimeID == 1 })?.state, .disabledByThisAppConnectionUnknown, "status did not expose automatic result")
-                try equal(OverviewViewModel(runtime: runtime).presentation.automaticEnabled, true, "overview was not bound to coordinator status")
+                try equal(SettingsSummaryViewModel(runtime: runtime).presentation.automaticEnabled, true, "settings summary was not bound to coordinator status")
                 try equal(DisplaysViewModel(runtime: runtime).rows.first(where: { $0.runtimeID == 1 })?.state, .disabledByThisAppConnectionUnknown, "display UI was not bound to coordinator status")
                 try equal(PresentationText.menu(status: status).displays.first(where: { $0.runtimeID == 1 })?.state, .disabledByThisAppConnectionUnknown, "menu was not bound to coordinator status")
+            }
+        }
+
+        runner.run("quick activation re-resolves UUID and confirms fresh disable plan") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let runtime = try coordinator(
+                    root: root,
+                    adapter: IntegrationAdapter(displays: [
+                        display(runtimeID: 1, identity: builtInIdentity, builtIn: true, main: true, name: "Built-in"),
+                        display(runtimeID: 2, identity: externalIdentity, builtIn: false, name: "External")
+                    ])
+                )
+                var target = try runtime.createBlankProfile(named: "工作")
+                guard let menuID = PresentationText.profileMenuEntries(status: runtime.status)
+                    .first(where: { $0.id == target.id })?.id else {
+                    throw Failure(description: "new Profile missing from menu presentation")
+                }
+
+                target.rules = [DisplayRule(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000402")!,
+                    name: "关闭内置显示器",
+                    isEnabled: true,
+                    priority: 100,
+                    conditions: [.always],
+                    actions: [TargetAction(target: .exact(builtInIdentity), action: .disable)]
+                )]
+                try store.saveProfile(target)
+
+                let preview = try runtime.previewProfileActivation(id: menuID, observation: nil)
+                let confirmation = PresentationText.profileActivationConfirmation(preview)
+                try equal(preview.profile.rules, target.rules, "quick activation used stale represented Profile content")
+                try expect(confirmation.requiresConfirmation, "fresh disable action did not require confirmation")
+                try expect(confirmation.isCritical, "disable confirmation was not critical")
+                try expect(!confirmation.confirmTitle.isEmpty, "disable confirmation omitted its explicit action")
+                let result = try runtime.activateProfile(id: menuID, confirmedPreview: preview)
+                try equal(result.preview.policyFingerprint, preview.policyFingerprint, "activation did not use the confirmed topology preview")
+            }
+        }
+
+        runner.run("guarded quick activation refuses topology drift") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let adapter = IntegrationAdapter(displays: [
+                    display(runtimeID: 1, identity: builtInIdentity, builtIn: true, main: true, name: "Built-in"),
+                    display(runtimeID: 2, identity: externalIdentity, builtIn: false, name: "External")
+                ])
+                let runtime = try coordinator(root: root, adapter: adapter)
+                let activeBefore = runtime.status.activeProfile?.id
+                let target = try runtime.createBlankProfile(named: "拓扑已变化")
+                let preview = try runtime.previewProfileActivation(id: target.id, observation: nil)
+                adapter.add(display(
+                    runtimeID: 3,
+                    identity: secondaryExternalIdentity,
+                    builtIn: false,
+                    name: "Arrived after confirmation"
+                ))
+
+                var refused = false
+                do {
+                    _ = try runtime.activateProfile(id: target.id, confirmedPreview: preview)
+                } catch AutomationCoordinatorError.staleProfileActivationPreview {
+                    refused = true
+                }
+
+                try expect(refused, "guarded quick activation accepted changed topology")
+                try equal(runtime.status.activeProfile?.id, activeBefore, "topology drift changed the live Active Profile")
+                try equal(try store.load().activeProfile.id, activeBefore, "topology drift changed the durable Active selector")
+                try expect(adapter.transactions.isEmpty, "topology drift reached display hardware")
+            }
+        }
+
+        runner.run("coordinator menu settings and persistence share one Active Profile") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                guard let originalActiveID = runtime.status.activeProfile?.id else {
+                    throw Failure(description: "initial Active Profile missing")
+                }
+                let target = try runtime.createBlankProfile(named: "下班")
+                let settings = ProfileManagementViewModel(runtime: runtime)
+
+                let didSelect = try settings.selectProfile(id: target.id)
+                try expect(didSelect, "Settings refused clean Profile selection")
+                try equal(settings.selectedProfileID, target.id, "Settings did not retain editing selection")
+                try equal(settings.activeProfileID, originalActiveID, "list navigation activated the selected Profile")
+                try equal(
+                    PresentationText.profileMenuEntries(status: runtime.status).filter(\.isActive).map(\.id),
+                    [originalActiveID],
+                    "menu checkmark followed Settings selection"
+                )
+
+                _ = try runtime.activateProfile(id: target.id)
+                settings.refreshFromRuntime()
+                try equal(runtime.status.activeProfile?.id, target.id, "coordinator did not publish activated identity")
+                try equal(settings.activeProfileID, target.id, "Settings missed the Active Profile change")
+                try equal(settings.selectedProfileID, target.id, "Settings changed its editing selection during activation")
+                try equal(
+                    PresentationText.profileMenuEntries(status: runtime.status).filter(\.isActive).map(\.id),
+                    [target.id],
+                    "menu did not mark the durable Active Profile"
+                )
+                try equal(try store.load().activeProfile.id, target.id, "persistence disagreed with coordinator and UI")
+            }
+        }
+
+        runner.run("dirty guard cancellation blocks external quick activation") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                let target = try runtime.createBlankProfile(named: "不应激活")
+                let settings = ProfileManagementViewModel(runtime: runtime)
+                let activeBefore = runtime.status.activeProfile?.id
+                let selectedBefore = settings.selectedProfileID
+                settings.setProfileName("未保存的名称")
+                try expect(settings.isDirty, "Settings draft did not become dirty")
+                var resolutionCount = 0
+
+                let allowed = try settings.prepareForExternalProfileActivation {
+                    resolutionCount += 1
+                    return .cancel
+                }
+                var activationCount = 0
+                if allowed {
+                    activationCount += 1
+                    _ = try runtime.activateProfile(id: target.id)
+                }
+
+                try expect(!allowed, "cancelled dirty guard allowed external activation")
+                try equal(resolutionCount, 1, "dirty guard did not ask exactly once")
+                try equal(activationCount, 0, "quick activation bypassed guard cancellation")
+                try expect(settings.isDirty, "cancellation discarded the dirty draft")
+                try equal(settings.selectedProfileID, selectedBefore, "cancellation changed the editing selection")
+                try equal(runtime.status.activeProfile?.id, activeBefore, "cancellation changed the live Active Profile")
+                try equal(try store.load().activeProfile.id, activeBefore, "cancellation changed the durable Active selector")
+            }
+        }
+
+        runner.run("dirty guard cancellation blocks the status-menu Automation toggle") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration(automatic: false))
+                let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                let settings = ProfileManagementViewModel(runtime: runtime)
+                settings.setProfileName("仍未保存")
+                try expect(settings.isDirty, "Automation guard setup did not create a dirty draft")
+
+                let allowed = try settings.prepareForExternalProfileActivation { .cancel }
+                var writeCount = 0
+                if allowed {
+                    writeCount += 1
+                    var configuration = runtime.status.configuration
+                    configuration.automatic.isEnabled.toggle()
+                    _ = try runtime.updateConfiguration(configuration, applyImmediately: true)
+                }
+
+                try expect(!allowed, "cancelled dirty guard allowed Automation toggle")
+                try equal(writeCount, 0, "Automation toggle wrote after dirty-guard cancellation")
+                try expect(settings.isDirty, "Automation cancellation discarded the Profile draft")
+                try equal(settings.draftProfile?.name, "仍未保存", "Automation cancellation overwrote the Profile draft")
+                try expect(!runtime.status.configuration.automatic.isEnabled, "Automation changed despite cancellation")
+                let persistedAutomatic = try store.load().activeProfile.automatic.isEnabled
+                try expect(!persistedAutomatic, "Automation persisted despite cancellation")
+            }
+        }
+
+        runner.run("stale quick-activation target is refused before selection changes") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                let activeID = runtime.status.activeProfile?.id
+                let target = try runtime.createBlankProfile(named: "即将删除")
+                guard let menuID = PresentationText.profileMenuEntries(status: runtime.status)
+                    .first(where: { $0.id == target.id })?.id else {
+                    throw Failure(description: "target missing from menu presentation")
+                }
+                try store.deleteProfile(id: menuID)
+
+                var refused = false
+                do { _ = try runtime.previewProfileActivation(id: menuID, observation: nil) }
+                catch { refused = true }
+                try expect(refused, "stale menu UUID resolved after its Profile was deleted")
+                try equal(runtime.status.activeProfile?.id, activeID, "stale preview changed the live Active Profile")
+                try equal(try store.load().activeProfile.id, activeID, "stale preview changed the durable Active selector")
+            }
+        }
+
+        runner.run("partial activation keeps durable and menu Active Profile truth") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let adapter = IntegrationAdapter(
+                    displays: [
+                        display(runtimeID: 1, identity: builtInIdentity, builtIn: true, main: true, name: "Built-in"),
+                        display(runtimeID: 2, identity: externalIdentity, builtIn: false, name: "External"),
+                        display(runtimeID: 3, identity: secondaryExternalIdentity, builtIn: false, name: "Second External")
+                    ],
+                    failingRuntimeIDs: [2]
+                )
+                let runtime = try coordinator(root: root, adapter: adapter)
+                var target = try runtime.createBlankProfile(named: "部分应用")
+                target.rules = [DisplayRule(
+                    id: UUID(uuidString: "00000000-0000-0000-0000-000000000403")!,
+                    name: "关闭两个显示器",
+                    isEnabled: true,
+                    priority: 100,
+                    conditions: [.always],
+                    actions: [
+                        TargetAction(target: .exact(builtInIdentity), action: .disable),
+                        TargetAction(target: .exact(externalIdentity), action: .disable)
+                    ]
+                )]
+                _ = try runtime.saveProfile(target, applyImmediately: false)
+
+                let result = try runtime.activateProfile(id: target.id)
+                try equal(result.hardwareOutcome, .partiallyFailed, "mixed hardware result was not partial")
+                try equal(runtime.status.activeProfile?.id, target.id, "partial result rolled back live Active Profile")
+                try equal(try store.load().activeProfile.id, target.id, "partial result rolled back durable Active selector")
+                let activeMenuEntries = PresentationText.profileMenuEntries(status: runtime.status).filter(\.isActive)
+                try equal(activeMenuEntries.map(\.id), [target.id], "menu checkmark followed hardware outcome instead of durable selection")
+                try expect(
+                    PresentationText.profileActivationResult(result).contains("当前配置档选择仍已保留"),
+                    "partial-result presentation did not separate selection truth from hardware outcome"
+                )
+            }
+        }
+
+        runner.run("Profile activation preserves the one global built-in toggle hotkey") {
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                var configuration = stableConfiguration()
+                let shortcut = HotKeyConfiguration(keyCode: 7, modifiers: 0x1200)
+                configuration.hotKey = shortcut
+                try store.save(configuration)
+                let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                let target = try runtime.createBlankProfile(named: "无独立快捷键")
+
+                _ = try runtime.activateProfile(id: target.id)
+
+                try equal(runtime.status.configuration.hotKey, shortcut, "Profile activation replaced the global built-in toggle hotkey")
+                try equal(try store.load().configuration.hotKey, shortcut, "Profile activation changed the persisted global hotkey")
+                try equal(ApplicationEntryPolicy.decision(arguments: ["DisplaySteward"]).mode, .menuBarApplication, "Profile activation introduced a separate launch path")
+            }
+        }
+
+        runner.run("global hotkey reconciliation rolls registration and persistence together") {
+            let previous = HotKeyConfiguration(keyCode: 7, modifiers: 0x1200)
+            let desired = HotKeyConfiguration(keyCode: 8, modifiers: 0x1200)
+            let unchanged = GlobalHotKeyReconciliationPolicy.plan(
+                registered: previous,
+                configured: previous
+            )
+            try expect(!unchanged.requiresRegistration, "matching hotkey requested redundant Carbon registration")
+
+            let replacement = GlobalHotKeyReconciliationPolicy.plan(
+                registered: previous,
+                configured: desired
+            )
+            try expect(replacement.requiresRegistration, "changed global hotkey did not request Carbon reconciliation")
+            try equal(
+                replacement.persistedConfiguration(afterRegistrationSucceeded: true),
+                desired,
+                "successful registration did not retain the configured shortcut"
+            )
+            try equal(
+                replacement.persistedConfiguration(afterRegistrationSucceeded: false),
+                previous,
+                "failed registration did not select the prior persisted shortcut for rollback"
+            )
+
+            let initiallyUnregistered = GlobalHotKeyReconciliationPolicy.plan(
+                registered: nil,
+                configured: desired
+            )
+            try expect(initiallyUnregistered.requiresRegistration, "missing Carbon registration was treated as synchronized")
+            try equal(
+                initiallyUnregistered.persistedConfiguration(afterRegistrationSucceeded: false),
+                desired,
+                "registration without a prior shortcut invented rollback state"
+            )
+        }
+
+        runner.run("termination resolves dirty Profile drafts before deciding") {
+            let cases: [(ProfileDraftResolution, ApplicationTerminationDecision, String)] = [
+                (.save, .terminateNow, "save"),
+                (.discard, .terminateNow, "discard"),
+                (.cancel, .cancel, "cancel")
+            ]
+            for (resolution, expectedDecision, label) in cases {
+                try withTemporaryDirectory { root in
+                    let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                    try store.save(stableConfiguration())
+                    let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                    let settings = ProfileManagementViewModel(runtime: runtime)
+                    guard let originalName = settings.draftProfile?.name else {
+                        throw Failure(description: "termination setup has no Active Profile draft")
+                    }
+                    let changedName = "termination-\(label)"
+                    settings.setProfileName(changedName)
+
+                    let allowed = try settings.prepareForExternalProfileActivation { resolution }
+                    let decision = ApplicationTerminationPolicy.decision(
+                        dirtyDraftGuardAllowsTermination: allowed
+                    )
+                    try equal(decision, expectedDecision, "\(label) resolution produced the wrong termination reply")
+                    let persistedName = try store.load().activeProfile.name
+                    switch resolution {
+                    case .save:
+                        try equal(persistedName, changedName, "termination save did not persist the draft")
+                    case .discard, .cancel:
+                        try equal(persistedName, originalName, "termination \(label) unexpectedly persisted the draft")
+                    }
+                }
+            }
+
+            try withTemporaryDirectory { root in
+                let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
+                try store.save(stableConfiguration())
+                let runtime = try coordinator(root: root, adapter: IntegrationAdapter(displays: []))
+                let settings = ProfileManagementViewModel(runtime: runtime)
+                settings.setProfileName("   ")
+                var allowed = false
+                do {
+                    allowed = try settings.prepareForExternalProfileActivation { .save }
+                } catch {
+                    allowed = false
+                }
+                try equal(
+                    ApplicationTerminationPolicy.decision(dirtyDraftGuardAllowsTermination: allowed),
+                    .cancel,
+                    "failed termination save did not cancel termination"
+                )
             }
         }
 

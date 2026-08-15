@@ -57,8 +57,8 @@ final class SevereNotificationPresenter {
             switch diagnostic.code {
             case .cycleRulesDisabled:
                 notices["cycle:\(diagnostic.message)"] = (
-                    "自动规则已隔离",
-                    "检测到规则循环。相关规则已在本轮停止执行，请打开“自动规则”检查预览。"
+                    "规则已隔离",
+                    "检测到规则循环。相关规则已在本轮停止执行，请打开“设置”中的“规则”检查预览。"
                 )
             case .configurationUnavailable:
                 notices["configuration:\(diagnostic.message)"] = (

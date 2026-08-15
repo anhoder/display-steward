@@ -1,2 +1,27 @@
+# Local orchestration
 .slim/deepwork/
+
+# Build products
 build/
+.build/
+DerivedData/
+*.dSYM/
+*.dSYM.zip
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift and Xcode user state
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~

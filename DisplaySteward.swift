@@ -30,8 +30,16 @@ private let defaultHotKey = KeyShortcut(
 
 private enum DisplayStewardError: LocalizedError {
     case builtinDisplayNotFound
+    case hotKeyReconciliationFailed(String)
 
-    var errorDescription: String? { "找不到内置显示器" }
+    var errorDescription: String? {
+        switch self {
+        case .builtinDisplayNotFound:
+            return "找不到内置显示器"
+        case .hotKeyReconciliationFailed(let explanation):
+            return explanation
+        }
+    }
 }
 
 private struct DisplaySnapshot {
@@ -64,6 +72,64 @@ final class DisplayController: DisplayManagingRuntime {
         observation: ObservedDisplaySnapshot?
     ) throws -> ConfigurationPreview {
         try coordinator.previewConfigurationReadOnly(configuration, observation: observation)
+    }
+    func previewProfileActivation(
+        id: UUID,
+        observation: ObservedDisplaySnapshot?
+    ) throws -> ProfileActivationPreview {
+        try coordinator.previewProfileActivation(id: id, observation: observation)
+    }
+
+    @discardableResult
+    func activateProfile(id: UUID) throws -> ProfileActivationResult {
+        try coordinator.activateProfile(id: id)
+    }
+    @discardableResult
+    func activateProfile(
+        id: UUID,
+        confirmedPreview: ProfileActivationPreview
+    ) throws -> ProfileActivationResult {
+        try coordinator.activateProfile(id: id, confirmedPreview: confirmedPreview)
+    }
+
+
+    @discardableResult
+    func createBlankProfile(named name: String) throws -> DisplayProfile {
+        try coordinator.createBlankProfile(named: name)
+    }
+
+    @discardableResult
+    func duplicateProfile(id: UUID, named name: String) throws -> DisplayProfile {
+        try coordinator.duplicateProfile(id: id, named: name)
+    }
+
+    @discardableResult
+    func renameProfile(id: UUID, to name: String) throws -> DisplayProfile {
+        try coordinator.renameProfile(id: id, to: name)
+    }
+
+    func deleteInactiveProfile(id: UUID) throws {
+        try coordinator.deleteInactiveProfile(id: id)
+    }
+
+    @discardableResult
+    func saveProfile(_ profile: DisplayProfile, applyImmediately: Bool) throws -> AutomationRuntimeStatus {
+        try coordinator.saveProfile(profile, applyImmediately: applyImmediately)
+    }
+    @discardableResult
+    func restoreProfileFromLastKnownGood(id: UUID) throws -> DisplayProfile {
+        try coordinator.restoreProfileFromLastKnownGood(id: id)
+    }
+
+    @discardableResult
+    func removeInvalidProfile(fileName: String) throws -> AutomationRuntimeStatus {
+        try coordinator.removeInvalidProfile(fileName: fileName)
+    }
+
+
+    @discardableResult
+    func reloadProfileCatalog() -> AutomationRuntimeStatus {
+        coordinator.reloadProfileCatalog()
     }
 
     @discardableResult
@@ -153,14 +219,14 @@ private final class ManualDisplayMenuCommand: NSObject {
 
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: DisplayController!
-    private var windowController: MainWindowController!
-    private var managementWindowController: ManagementWindowController!
+    private var settingsWindowController: SettingsWindowController!
     private var statusItem: NSStatusItem!
     private var observer: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var activeHotKey: KeyShortcut?
+    private var isReconcilingHotKey = false
     private lazy var severeNotifications = SevereNotificationPresenter(
         delivery: SystemSevereNotificationDelivery(log: writeLog)
     )
@@ -178,26 +244,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        managementWindowController = ManagementWindowController(
-            runtime: controller,
-            onLastActiveSafetyBlock: { [weak self] in
-                self?.severeNotifications.presentManualLastActiveSafetyBlock()
-            }
-        )
-        windowController = MainWindowController(
+        settingsWindowController = SettingsWindowController(
             runtime: controller,
             shortcutProvider: { [weak self] in self?.configuredHotKey ?? defaultHotKey },
             shortcutSetter: { [weak self] shortcut in self?.setShortcut(shortcut) ?? false },
             shortcutResetter: { [weak self] in self?.resetShortcut() ?? false },
-            onOpenManagement: { [weak self] in self?.managementWindowController.show() }
+            onLastActiveSafetyBlock: { [weak self] in
+                self?.severeNotifications.presentManualLastActiveSafetyBlock()
+            }
         )
         setupStatusItem()
         registerGlobalHotKey()
         severeNotifications.requestAuthorization()
         controller.onStatusChange = { [weak self] in
             guard let self else { return }
-            self.windowController?.refresh()
-            self.managementWindowController?.refresh()
+            self.reconcileGlobalHotKeyIfNeeded()
+            self.settingsWindowController?.refresh()
             self.updateMenu()
             self.severeNotifications.present(status: self.controller.status)
         }
@@ -220,6 +282,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.start()
         severeNotifications.present(status: controller.status)
         writeLog("[AUTO] application started; automatic=\(controller.configuration.automatic.isEnabled)")
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let allowed = settingsWindowController?.prepareForExternalProfileActivation() ?? true
+        switch ApplicationTerminationPolicy.decision(dirtyDraftGuardAllowsTermination: allowed) {
+        case .terminateNow: return .terminateNow
+        case .cancel: return .terminateCancel
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -292,9 +362,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let status = registerHotKey(shortcut)
         guard status == noErr else {
             writeLog("[HOTKEY] registration failed for \(shortcut.displayName): \(status)")
+            self.hotKeyRef = nil
             restoreHotKey(previous)
             return false
         }
+        activeHotKey = shortcut
 
         var configuration = controller.configuration
         configuration.hotKey = HotKeyConfiguration(
@@ -313,7 +385,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
-        activeHotKey = shortcut
         writeLog("[HOTKEY] shortcut changed to \(shortcut.displayName)")
         updateMenu()
         return true
@@ -327,6 +398,64 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let status = registerHotKey(shortcut)
         activeHotKey = status == noErr ? shortcut : nil
         writeLog("[HOTKEY] previous shortcut restore status=\(status)")
+    }
+
+    private func reconcileGlobalHotKeyIfNeeded() {
+        guard !isReconcilingHotKey, controller != nil else { return }
+        let registered = activeHotKey.map {
+            HotKeyConfiguration(keyCode: $0.keyCode, modifiers: $0.modifiers)
+        }
+        let plan = GlobalHotKeyReconciliationPolicy.plan(
+            registered: registered,
+            configured: controller.configuration.hotKey
+        )
+        guard plan.requiresRegistration else { return }
+
+        isReconcilingHotKey = true
+        defer { isReconcilingHotKey = false }
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
+
+        let desired = KeyShortcut(keyCode: plan.desired.keyCode, modifiers: plan.desired.modifiers)
+        let registerStatus = registerHotKey(desired)
+        if registerStatus == noErr {
+            activeHotKey = desired
+            writeLog("[HOTKEY] reconciled registration to \(desired.displayName)")
+            return
+        }
+
+        self.hotKeyRef = nil
+        activeHotKey = nil
+        var registrationWasRestored = false
+        if let previous = plan.previous {
+            let previousShortcut = KeyShortcut(keyCode: previous.keyCode, modifiers: previous.modifiers)
+            let restoreStatus = registerHotKey(previousShortcut)
+            registrationWasRestored = restoreStatus == noErr
+            activeHotKey = registrationWasRestored ? previousShortcut : nil
+            writeLog("[HOTKEY] reconciliation restore status=\(restoreStatus)")
+        }
+
+        let rollback = plan.persistedConfiguration(afterRegistrationSucceeded: false)
+        var persistenceWasRestored = controller.configuration.hotKey == rollback
+        if !persistenceWasRestored {
+            var configuration = controller.configuration
+            configuration.hotKey = rollback
+            do {
+                _ = try controller.updateConfiguration(configuration, applyImmediately: false)
+                persistenceWasRestored = true
+            } catch {
+                writeLog("[HOTKEY] reconciliation persistence rollback failed: \(error.localizedDescription)")
+            }
+        }
+
+        let restoration = registrationWasRestored && persistenceWasRestored
+            ? "已恢复之前的快捷键注册与持久化设置。"
+            : "无法完整恢复之前的快捷键；请在设置中重新选择快捷键。"
+        let message = "无法注册快捷键 \(desired.displayName)（状态 \(registerStatus)）。\(restoration)"
+        writeLog("[HOTKEY] \(message)")
+        showError(DisplayStewardError.hotKeyReconciliationFailed(message))
     }
 
     private func resetShortcut() -> Bool { setShortcut(defaultHotKey) }
@@ -377,15 +506,43 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let status = controller.status
         let presentation = PresentationText.menu(status: status)
         let menu = NSMenu()
-        let overviewItem = NSMenuItem(title: "打开概览", action: #selector(openOverview), keyEquivalent: "")
-        overviewItem.target = self
-        menu.addItem(overviewItem)
-        let managementItem = NSMenuItem(title: "管理自动规则与显示器…", action: #selector(openManagement), keyEquivalent: ",")
-        managementItem.target = self
-        menu.addItem(managementItem)
+        let settingsItem = NSMenuItem(title: "打开设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+        let profilesItem = NSMenuItem(title: "配置档", action: nil, keyEquivalent: "")
+        let profilesMenu = NSMenu(title: "配置档")
+        let profileEntries = PresentationText.profileMenuEntries(status: status)
+        if profileEntries.isEmpty {
+            let empty = NSMenuItem(title: "没有可用配置档", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            profilesMenu.addItem(empty)
+        } else {
+            for entry in profileEntries {
+                let item = NSMenuItem(
+                    title: entry.title,
+                    action: #selector(activateProfileFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.state = entry.isActive ? .on : .off
+                item.representedObject = entry.id
+                profilesMenu.addItem(item)
+            }
+        }
+        if !status.profileCatalog.invalidProfiles.isEmpty {
+            profilesMenu.addItem(.separator())
+            let invalid = NSMenuItem(title: "部分配置档无效", action: nil, keyEquivalent: "")
+            invalid.isEnabled = false
+            profilesMenu.addItem(invalid)
+            let manage = NSMenuItem(title: "在设置中管理…", action: #selector(openSettings), keyEquivalent: "")
+            manage.target = self
+            profilesMenu.addItem(manage)
+        }
+        profilesItem.submenu = profilesMenu
+        menu.addItem(profilesItem)
         menu.addItem(.separator())
 
-        let summaryItem = NSMenuItem(title: PresentationText.overview(status: status).onlineActiveSummary, action: nil, keyEquivalent: "")
+        let summaryItem = NSMenuItem(title: PresentationText.settingsSummary(status: status).onlineActiveSummary, action: nil, keyEquivalent: "")
         summaryItem.isEnabled = false
         menu.addItem(summaryItem)
         let restoreAllItem = NSMenuItem(title: PresentationText.restoreAllTitle, action: #selector(restoreAllDisplays), keyEquivalent: "")
@@ -397,7 +554,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             recoveryExplanation.isEnabled = false
             menu.addItem(recoveryExplanation)
         }
-        let automaticItem = NSMenuItem(title: "启用自动规则", action: #selector(toggleAutomatic), keyEquivalent: "")
+        let automaticItem = NSMenuItem(title: "启用自动化", action: #selector(toggleAutomatic), keyEquivalent: "")
         automaticItem.target = self
         automaticItem.state = presentation.automaticEnabled ? .on : .off
         menu.addItem(automaticItem)
@@ -459,9 +616,60 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc private func openOverview() { windowController.show() }
-    @objc private func openManagement() { managementWindowController.show() }
-    @objc private func toggleAutomatic() { setAutomatic(!controller.configuration.automatic.isEnabled) }
+    @objc private func openSettings() { settingsWindowController.show() }
+    @objc private func activateProfileFromMenu(_ sender: NSMenuItem) {
+        guard let profileID = sender.representedObject as? UUID else { return }
+        guard settingsWindowController.prepareForExternalProfileActivation() else { return }
+
+        do {
+            let preview = try controller.previewProfileActivation(id: profileID, observation: nil)
+            let confirmation = PresentationText.profileActivationConfirmation(preview)
+            if confirmation.requiresConfirmation {
+                let alert = NSAlert()
+                alert.alertStyle = confirmation.isCritical ? .critical : .warning
+                alert.messageText = confirmation.title
+                alert.informativeText = confirmation.explanation
+                alert.addButton(withTitle: confirmation.confirmTitle)
+                alert.addButton(withTitle: "取消")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+
+            let result = try controller.activateProfile(id: profileID, confirmedPreview: preview)
+            settingsWindowController.refresh()
+            updateMenu()
+            presentProfileActivationResultIfNeeded(result)
+        } catch {
+            showError(error)
+        }
+    }
+
+    private func presentProfileActivationResultIfNeeded(_ result: ProfileActivationResult) {
+        let title: String
+        let style: NSAlert.Style
+        switch result.hardwareOutcome {
+        case .partiallyFailed:
+            title = "配置档已激活，但部分显示器操作失败"
+            style = .warning
+        case .failed:
+            title = "配置档已激活，但显示器操作失败"
+            style = .warning
+        case .blockedBySafety:
+            title = "配置档已激活，但显示器操作被安全策略阻止"
+            style = .critical
+        case .notNeeded, .applied:
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = style
+        alert.messageText = title
+        alert.informativeText = PresentationText.profileActivationResult(result)
+        alert.runModal()
+    }
+    @objc private func toggleAutomatic() {
+        guard settingsWindowController.prepareForExternalProfileActivation() else { return }
+        setAutomatic(!controller.configuration.automatic.isEnabled)
+    }
     @objc private func togglePause() { controller.status.isPaused ? controller.resume() : controller.pause() }
     @objc private func restoreAllDisplays() {
         runDisplayRecoveryFlow(runtime: controller, in: nil)

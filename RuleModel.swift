@@ -202,6 +202,111 @@ struct KnownDisplay: Codable, Equatable {
     var alias: String? = nil
 }
 
+struct ApplicationSettings: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var activeProfileID: UUID
+    var hotKey: HotKeyConfiguration
+    var deviceHistory: [KnownDisplay]
+
+    func validate() throws {
+        var issues: [ConfigurationValidationIssue] = []
+        if schemaVersion != Self.currentSchemaVersion {
+            issues.append(.init(path: "schemaVersion", message: "unsupported schema version \(schemaVersion)"))
+        }
+        if activeProfileID.isZero {
+            issues.append(.init(path: "activeProfileID", message: "must be a nonzero UUID"))
+        }
+
+        let assembled = AppConfiguration(
+            schemaVersion: AppConfiguration.currentSchemaVersion,
+            automatic: .default,
+            polling: .default,
+            hotKey: hotKey,
+            deviceHistory: deviceHistory,
+            rules: []
+        )
+        issues.append(contentsOf: assembled.validationIssues())
+        if !issues.isEmpty { throw ConfigurationValidationError(issues: issues) }
+    }
+}
+
+struct DisplayProfile: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var id: UUID
+    var name: String
+    var automatic: AutomaticConfiguration
+    var polling: PollingConfiguration
+    var rules: [DisplayRule]
+
+    static func blank(id: UUID = UUID(), name: String) -> DisplayProfile {
+        DisplayProfile(
+            schemaVersion: currentSchemaVersion,
+            id: id,
+            name: name,
+            automatic: AutomaticConfiguration(
+                isEnabled: false,
+                startupStabilizationSeconds: AutomaticConfiguration.default.startupStabilizationSeconds,
+                wakeStabilizationSeconds: AutomaticConfiguration.default.wakeStabilizationSeconds
+            ),
+            polling: PollingConfiguration(
+                isEnabled: false,
+                intervalSeconds: PollingConfiguration.default.intervalSeconds
+            ),
+            rules: []
+        )
+    }
+
+    func validate() throws {
+        var issues: [ConfigurationValidationIssue] = []
+        if schemaVersion != Self.currentSchemaVersion {
+            issues.append(.init(path: "schemaVersion", message: "unsupported schema version \(schemaVersion)"))
+        }
+        if id.isZero {
+            issues.append(.init(path: "id", message: "must be a nonzero UUID"))
+        }
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(.init(path: "name", message: "must not be empty"))
+        }
+
+        let assembled = AppConfiguration(
+            schemaVersion: AppConfiguration.currentSchemaVersion,
+            automatic: automatic,
+            polling: polling,
+            hotKey: .default,
+            deviceHistory: [],
+            rules: rules
+        )
+        issues.append(contentsOf: assembled.validationIssues())
+        if !issues.isEmpty { throw ConfigurationValidationError(issues: issues) }
+    }
+
+    static func namesAreEqual(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.compare(
+            rhs,
+            options: [.caseInsensitive],
+            range: nil,
+            locale: Locale(identifier: "en_US_POSIX")
+        ) == .orderedSame
+    }
+
+    static func orderedByName(_ lhs: DisplayProfile, _ rhs: DisplayProfile) -> Bool {
+        let insensitive = lhs.name.compare(
+            rhs.name,
+            options: [.caseInsensitive],
+            range: nil,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        if insensitive != .orderedSame { return insensitive == .orderedAscending }
+        let exact = lhs.name.compare(rhs.name, options: [.literal])
+        if exact != .orderedSame { return exact == .orderedAscending }
+        return lhs.id.uuidString < rhs.id.uuidString
+    }
+}
+
 struct AppConfiguration: Codable, Equatable {
     static let currentSchemaVersion = 1
 
@@ -221,7 +326,59 @@ struct AppConfiguration: Codable, Equatable {
         rules: []
     )
 
+    init(
+        schemaVersion: Int,
+        automatic: AutomaticConfiguration,
+        polling: PollingConfiguration,
+        hotKey: HotKeyConfiguration,
+        deviceHistory: [KnownDisplay],
+        rules: [DisplayRule]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.automatic = automatic
+        self.polling = polling
+        self.hotKey = hotKey
+        self.deviceHistory = deviceHistory
+        self.rules = rules
+    }
+
+    init(settings: ApplicationSettings, profile: DisplayProfile) {
+        self.init(
+            schemaVersion: Self.currentSchemaVersion,
+            automatic: profile.automatic,
+            polling: profile.polling,
+            hotKey: settings.hotKey,
+            deviceHistory: settings.deviceHistory,
+            rules: profile.rules
+        )
+    }
+
+    func applicationSettings(activeProfileID: UUID) -> ApplicationSettings {
+        ApplicationSettings(
+            schemaVersion: ApplicationSettings.currentSchemaVersion,
+            activeProfileID: activeProfileID,
+            hotKey: hotKey,
+            deviceHistory: deviceHistory
+        )
+    }
+
+    func displayProfile(id: UUID, name: String) -> DisplayProfile {
+        DisplayProfile(
+            schemaVersion: DisplayProfile.currentSchemaVersion,
+            id: id,
+            name: name,
+            automatic: automatic,
+            polling: polling,
+            rules: rules
+        )
+    }
+
     func validate() throws {
+        let issues = validationIssues()
+        if !issues.isEmpty { throw ConfigurationValidationError(issues: issues) }
+    }
+
+    fileprivate func validationIssues() -> [ConfigurationValidationIssue] {
         var issues: [ConfigurationValidationIssue] = []
 
         if schemaVersion != Self.currentSchemaVersion {
@@ -279,7 +436,7 @@ struct AppConfiguration: Codable, Equatable {
             }
         }
 
-        if !issues.isEmpty { throw ConfigurationValidationError(issues: issues) }
+        return issues
     }
 
     private func validate(
@@ -334,4 +491,8 @@ struct ConfigurationValidationError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         issues.map { "\($0.path): \($0.message)" }.joined(separator: "; ")
     }
+}
+
+private extension UUID {
+    var isZero: Bool { uuidString == "00000000-0000-0000-0000-000000000000" }
 }

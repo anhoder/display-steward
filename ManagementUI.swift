@@ -9,8 +9,9 @@ enum InterfaceMetrics {
     static let space4: CGFloat = 16
     static let space5: CGFloat = 24
     static let space6: CGFloat = 32
-    static let mainWindowSize = NSSize(width: 540, height: 500)
-    static let managementWindowSize = NSSize(width: 980, height: 680)
+    static let settingsWindowSize = NSSize(width: 1160, height: 720)
+    static let settingsContentWidth: CGFloat = 760
+    static let profilesListWidth: CGFloat = 272
     static let rulesListWidth: CGFloat = 248
     static let displaysListWidth: CGFloat = 292
     static let controlWidth: CGFloat = 160
@@ -26,6 +27,14 @@ enum InterfaceColors {
 }
 
 private enum LabelStyle { case title, section, body, secondary }
+
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class FlippedStackView: NSStackView {
+    override var isFlipped: Bool { true }
+}
 
 private func makeLabel(_ text: String, style: LabelStyle = .body) -> NSTextField {
     let label = NSTextField(wrappingLabelWithString: text)
@@ -109,129 +118,380 @@ func runDisplayRecoveryFlow(runtime: DisplayManagingRuntime, in window: NSWindow
     }
 }
 
-final class MainWindowController: NSWindowController {
-    private let viewModel: OverviewViewModel
+private enum ProfileTableEntry {
+    case profile(DisplayProfile)
+    case invalid(InvalidDisplayProfile)
+}
+
+private final class InvalidProfileButton: NSButton {
+    var invalidProfile: InvalidDisplayProfile?
+}
+
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    enum Detail: Equatable { case rules, displays }
+
+    private let viewModel: SettingsSummaryViewModel
+    let profileViewModel: ProfileManagementViewModel
     private let shortcutProvider: () -> KeyShortcut
     private let shortcutSetter: (KeyShortcut) -> Bool
     private let shortcutResetter: () -> Bool
-    private let onOpenManagement: () -> Void
-    private let summaryLabel = makeLabel("", style: .title)
+    private let dirtyDraftResolutionProvider: (() -> ProfileDraftResolution)?
+    private let rootController = NSViewController()
+    private let profileSplit = NSSplitView()
+    private let profileTable = NSTableView()
+    private var profileEntries: [ProfileTableEntry] = []
+    private var restoringProfileSelection = false
+    private let contentContainer = NSView()
+    private let summaryScroll = NSScrollView()
+    private let summaryDocument = FlippedView()
+    private let summaryStack = NSStackView()
+    private let detailView = NSView()
+    private let detailHost = NSView()
+    private let detailTitleLabel = makeLabel("", style: .title)
+    private let activeProfileLabel = makeLabel("", style: .title)
+    private let selectedProfileLabel = makeLabel("", style: .section)
     private let stateLabel = makeLabel("", style: .body)
     private let evaluationLabel = makeLabel("", style: .secondary)
-    private let automaticCheckbox = NSButton(checkboxWithTitle: "启用自动规则", target: nil, action: nil)
+    private let rulesSummaryLabel = makeLabel("", style: .body)
+    private let displaysSummaryLabel = makeLabel("", style: .body)
+    private let profileNameField = NSTextField(string: "")
+    private let automaticCheckbox = NSButton(checkboxWithTitle: "启用自动化", target: nil, action: nil)
     private let pauseButton = NSButton(title: "暂停自动化", target: nil, action: nil)
     private let pollingCheckbox = NSButton(checkboxWithTitle: "启用定时检查", target: nil, action: nil)
     private let pollingIntervalField = NSTextField(string: "3")
     private let shortcutRecorder = ShortcutRecorderButton()
     private let resetShortcutButton = NSButton(title: "恢复默认", target: nil, action: nil)
-    private let manageButton = NSButton(title: "管理自动规则与显示器…", target: nil, action: nil)
-    private let refreshButton = NSButton(title: "刷新状态", target: nil, action: nil)
     private let recoverySection = NSStackView()
     private let recoveryNoticeLabel = makeLabel("", style: .secondary)
     private let restoreAllButton = NSButton(title: PresentationText.restoreAllTitle, target: nil, action: nil)
+    private let profileReloadNoticeLabel = makeLabel("", style: .secondary)
+    private let saveButton = NSButton(title: "保存", target: nil, action: nil)
+    private let saveAndActivateButton = NSButton(title: "保存并激活", target: nil, action: nil)
+    let rulesController: RulesPageViewController
+    let displaysController: DisplaysPageViewController
+    private(set) var activeDetail: Detail?
 
-    init(runtime: DisplayManagingRuntime, shortcutProvider: @escaping () -> KeyShortcut, shortcutSetter: @escaping (KeyShortcut) -> Bool, shortcutResetter: @escaping () -> Bool, onOpenManagement: @escaping () -> Void) {
-        viewModel = OverviewViewModel(runtime: runtime)
+    init(
+        runtime: DisplayManagingRuntime,
+        shortcutProvider: @escaping () -> KeyShortcut,
+        shortcutSetter: @escaping (KeyShortcut) -> Bool,
+        shortcutResetter: @escaping () -> Bool,
+        onLastActiveSafetyBlock: @escaping () -> Void,
+        dirtyDraftResolutionProvider: (() -> ProfileDraftResolution)? = nil
+    ) {
+        viewModel = SettingsSummaryViewModel(runtime: runtime)
+        let profileViewModel = ProfileManagementViewModel(runtime: runtime)
+        self.profileViewModel = profileViewModel
         self.shortcutProvider = shortcutProvider
         self.shortcutSetter = shortcutSetter
         self.shortcutResetter = shortcutResetter
-        self.onOpenManagement = onOpenManagement
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: InterfaceMetrics.mainWindowSize), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = displayStewardAppName
+        self.dirtyDraftResolutionProvider = dirtyDraftResolutionProvider
+        rulesController = RulesPageViewController(viewModel: profileViewModel)
+        displaysController = DisplaysPageViewController(runtime: runtime, onLastActiveSafetyBlock: onLastActiveSafetyBlock)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: InterfaceMetrics.settingsWindowSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "\(displayStewardAppName) 设置"
         window.center()
         window.isReleasedWhenClosed = false
+        window.minSize = InterfaceMetrics.settingsWindowSize
         super.init(window: window)
         buildView()
+        window.delegate = self
+        showSummary()
         refresh()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func show() {
+    func show(detail: Detail? = nil) {
+        if let detail { showDetail(detail) } else { showSummary() }
         refresh()
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func showSummary() {
+        activeDetail = nil
+        installContent(summaryScroll)
+    }
+
+    func showDetail(_ detail: Detail) {
+        activeDetail = detail
+        detailTitleLabel.stringValue = detail == .rules ? "规则草稿" : "显示器"
+        for subview in detailHost.subviews { subview.removeFromSuperview() }
+        let controller = detail == .rules ? rulesController : displaysController
+        let pageView = controller.view
+        pageView.translatesAutoresizingMaskIntoConstraints = false
+        detailHost.addSubview(pageView)
+        NSLayoutConstraint.activate([
+            pageView.leadingAnchor.constraint(equalTo: detailHost.leadingAnchor),
+            pageView.trailingAnchor.constraint(equalTo: detailHost.trailingAnchor),
+            pageView.topAnchor.constraint(equalTo: detailHost.topAnchor),
+            pageView.bottomAnchor.constraint(equalTo: detailHost.bottomAnchor)
+        ])
+        installContent(detailView)
+        refresh()
+    }
+
     func refresh() {
+        profileViewModel.refreshFromRuntime()
+        rulesController.refreshFromRuntime()
+        displaysController.refreshFromRuntime()
+        rebuildProfileEntries()
+        restoringProfileSelection = true
+        profileTable.reloadData()
+        restoreProfileSelection()
+        restoringProfileSelection = false
+
         let presentation = viewModel.presentation
-        summaryLabel.stringValue = presentation.onlineActiveSummary
+        let activeName = viewModel.runtime.status.activeProfile?.name ?? "不可用"
+        activeProfileLabel.stringValue = "当前配置档：\(activeName)"
         stateLabel.stringValue = presentation.automationState
         stateLabel.textColor = presentation.hasFailure ? InterfaceColors.destructive : InterfaceColors.secondaryText
         evaluationLabel.stringValue = "最近评估 · \(presentation.lastEvaluationSummary)"
-        automaticCheckbox.state = presentation.automaticEnabled ? .on : .off
         pauseButton.title = presentation.pauseButtonTitle
         pauseButton.isEnabled = presentation.automaticEnabled || presentation.isPaused
-        pollingCheckbox.state = presentation.pollingEnabled ? .on : .off
-        pollingCheckbox.isEnabled = presentation.automaticEnabled
-        pollingIntervalField.doubleValue = presentation.pollingInterval
-        pollingIntervalField.isEnabled = presentation.automaticEnabled && presentation.pollingEnabled
         shortcutRecorder.shortcut = shortcutProvider()
         recoverySection.isHidden = presentation.recoveryCount == 0
         recoveryNoticeLabel.stringValue = presentation.recoveryNotice ?? ""
         restoreAllButton.isEnabled = presentation.recoveryCount > 0
+        let reloadNotices = PresentationText.applicationSettingsReloadNotices(status: viewModel.runtime.status)
+        profileReloadNoticeLabel.isHidden = reloadNotices.isEmpty
+        profileReloadNoticeLabel.stringValue = reloadNotices.map(\.title).joined(separator: "\n")
+        profileReloadNoticeLabel.toolTip = reloadNotices.map(\.explanation).joined(separator: "\n\n")
+        profileReloadNoticeLabel.textColor = reloadNotices.contains(where: { $0.severity == .critical })
+            ? InterfaceColors.destructive
+            : InterfaceColors.warning
+
+        guard let profile = profileViewModel.draftProfile else {
+            selectedProfileLabel.stringValue = "未选择配置档"
+            profileNameField.stringValue = ""
+            profileNameField.isEnabled = false
+            automaticCheckbox.isEnabled = false
+            pollingCheckbox.isEnabled = false
+            pollingIntervalField.isEnabled = false
+            rulesSummaryLabel.stringValue = "没有可编辑的规则"
+            saveButton.isEnabled = false
+            saveAndActivateButton.isHidden = true
+            return
+        }
+        selectedProfileLabel.stringValue = profileViewModel.isSelectedProfileActive
+            ? "正在编辑：\(profile.name) · 当前"
+            : "正在编辑：\(profile.name) · 未激活"
+        if window?.firstResponder !== profileNameField.currentEditor() { profileNameField.stringValue = profile.name }
+        profileNameField.isEnabled = true
+        automaticCheckbox.state = profile.automatic.isEnabled ? .on : .off
+        automaticCheckbox.isEnabled = true
+        pollingCheckbox.state = profile.polling.isEnabled ? .on : .off
+        pollingCheckbox.isEnabled = profile.automatic.isEnabled
+        if window?.firstResponder !== pollingIntervalField.currentEditor() {
+            pollingIntervalField.doubleValue = profile.polling.intervalSeconds
+        }
+        pollingIntervalField.isEnabled = profile.automatic.isEnabled && profile.polling.isEnabled
+        let enabledRules = profile.rules.filter(\.isEnabled).count
+        rulesSummaryLabel.stringValue = "\(profile.rules.count) 条规则 · \(enabledRules) 条已启用 · \(profileViewModel.isDirty ? "有未保存修改" : "已保存")"
+        displaysSummaryLabel.stringValue = "当前 \(displaysController.viewModel.currentRows.count) 台 · 历史 \(displaysController.viewModel.historicalRows.count) 条"
+        saveButton.title = profileViewModel.isSelectedProfileActive ? "保存并应用" : "保存"
+        saveButton.isEnabled = profileViewModel.isDirty
+        saveAndActivateButton.isHidden = profileViewModel.isSelectedProfileActive
+        saveAndActivateButton.isEnabled = !profileViewModel.isSelectedProfileActive
     }
 
+    func prepareForExternalProfileActivation() -> Bool {
+        window?.makeFirstResponder(nil)
+        flushDraftFields()
+        do {
+            return try profileViewModel.prepareForExternalProfileActivation { [weak self] in
+                self?.dirtyDraftResolution(reason: "切换当前配置档前") ?? .cancel
+            }
+        } catch {
+            showPresentationError(error, message: "无法处理配置档草稿", in: window)
+            return false
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool { prepareForExternalProfileActivation() }
+
     private func buildView() {
-        guard let contentView = window?.contentView else { return }
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = InterfaceMetrics.space5
-        root.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(root)
-        let header = NSStackView()
-        header.orientation = .vertical
-        header.alignment = .leading
-        header.spacing = InterfaceMetrics.space2
-        header.addArrangedSubview(makeLabel("显示器概览", style: .secondary))
-        header.addArrangedSubview(summaryLabel)
-        header.addArrangedSubview(stateLabel)
-        header.addArrangedSubview(evaluationLabel)
-        evaluationLabel.maximumNumberOfLines = 2
-        root.addArrangedSubview(header)
-        let automationSection = NSStackView()
-        automationSection.orientation = .vertical
-        automationSection.alignment = .leading
-        automationSection.spacing = InterfaceMetrics.space3
-        automationSection.addArrangedSubview(makeLabel("自动化", style: .section))
-        let automaticRow = NSStackView(views: [automaticCheckbox, pauseButton])
-        automaticRow.orientation = .horizontal
-        automaticRow.spacing = InterfaceMetrics.space3
-        automationSection.addArrangedSubview(automaticRow)
-        let pollingRow = NSStackView()
-        pollingRow.orientation = .horizontal
-        pollingRow.spacing = InterfaceMetrics.space2
-        pollingRow.addArrangedSubview(pollingCheckbox)
-        pollingRow.addArrangedSubview(makeLabel("间隔", style: .secondary))
-        pollingRow.addArrangedSubview(pollingIntervalField)
-        pollingRow.addArrangedSubview(makeLabel("秒", style: .secondary))
-        automationSection.addArrangedSubview(pollingRow)
-        root.addArrangedSubview(automationSection)
-        let shortcutSection = NSStackView()
-        shortcutSection.orientation = .vertical
-        shortcutSection.alignment = .leading
-        shortcutSection.spacing = InterfaceMetrics.space3
-        shortcutSection.addArrangedSubview(makeLabel("切换内置显示器快捷键", style: .section))
-        shortcutSection.addArrangedSubview(makeLabel("快捷键独立于自动规则；手动切换后自动化会暂停。", style: .secondary))
-        let shortcutRow = NSStackView(views: [shortcutRecorder, resetShortcutButton])
-        shortcutRow.orientation = .horizontal
-        shortcutRow.spacing = InterfaceMetrics.space2
-        shortcutSection.addArrangedSubview(shortcutRow)
-        root.addArrangedSubview(shortcutSection)
+        let root = NSView()
+        rootController.view = root
+        window?.contentViewController = rootController
+        rootController.addChild(rulesController)
+        rootController.addChild(displaysController)
+        profileSplit.identifier = NSUserInterfaceItemIdentifier("settingsProfileSplit")
+        profileSplit.isVertical = true
+        profileSplit.dividerStyle = .thin
+        profileSplit.translatesAutoresizingMaskIntoConstraints = false
+        profileSplit.addArrangedSubview(buildProfileSidebar())
+        profileSplit.addArrangedSubview(contentContainer)
+        profileSplit.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        root.addSubview(profileSplit)
+        NSLayoutConstraint.activate([
+            profileSplit.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            profileSplit.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            profileSplit.topAnchor.constraint(equalTo: root.topAnchor),
+            profileSplit.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+        buildSummaryView()
+        buildDetailView()
+    }
+
+    private func buildProfileSidebar() -> NSView {
+        let container = NSView()
+        container.identifier = NSUserInterfaceItemIdentifier("settingsProfileSidebar")
+        let heading = makeLabel("显示配置档", style: .section)
+        let explanation = makeLabel("选择只会打开草稿，不会激活或操作显示器。", style: .secondary)
+        explanation.maximumNumberOfLines = 3
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("profile"))
+        profileTable.identifier = NSUserInterfaceItemIdentifier("settingsProfileList")
+        profileTable.addTableColumn(column)
+        profileTable.headerView = nil
+        profileTable.delegate = self
+        profileTable.dataSource = self
+        profileTable.allowsEmptySelection = false
+        profileReloadNoticeLabel.identifier = NSUserInterfaceItemIdentifier("profileReloadNotice")
+        profileReloadNoticeLabel.maximumNumberOfLines = 6
+        scroll.documentView = profileTable
+        let add = NSButton(title: "+", target: self, action: #selector(newProfileClicked))
+        add.toolTip = "新建空白配置档或复制当前草稿的配置档"
+        let duplicate = NSButton(title: "复制", target: self, action: #selector(duplicateProfileClicked))
+        duplicate.identifier = NSUserInterfaceItemIdentifier("duplicateProfileButton")
+        let delete = NSButton(title: "删除", target: self, action: #selector(deleteProfileClicked))
+        delete.identifier = NSUserInterfaceItemIdentifier("deleteProfileButton")
+        delete.contentTintColor = InterfaceColors.destructive
+        let actions = NSStackView(views: [add, duplicate, delete])
+        actions.orientation = .horizontal
+        actions.spacing = InterfaceMetrics.space2
+        let reload = NSButton(title: "重新加载配置档", target: self, action: #selector(reloadProfilesClicked))
+        reload.identifier = NSUserInterfaceItemIdentifier("reloadProfilesButton")
+        for child in [heading, explanation, scroll, profileReloadNoticeLabel, actions, reload] {
+            child.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(child)
+        }
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: InterfaceMetrics.profilesListWidth),
+            heading.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: InterfaceMetrics.space4),
+            heading.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -InterfaceMetrics.space4),
+            heading.topAnchor.constraint(equalTo: container.topAnchor, constant: InterfaceMetrics.space4),
+            explanation.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            explanation.trailingAnchor.constraint(equalTo: heading.trailingAnchor),
+            explanation.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: InterfaceMetrics.space1),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: explanation.bottomAnchor, constant: InterfaceMetrics.space3),
+            scroll.bottomAnchor.constraint(equalTo: profileReloadNoticeLabel.topAnchor, constant: -InterfaceMetrics.space2),
+            profileReloadNoticeLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: InterfaceMetrics.space4),
+            profileReloadNoticeLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -InterfaceMetrics.space4),
+            profileReloadNoticeLabel.bottomAnchor.constraint(equalTo: actions.topAnchor, constant: -InterfaceMetrics.space3),
+            actions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: InterfaceMetrics.space4),
+            reload.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: InterfaceMetrics.space4),
+            reload.topAnchor.constraint(equalTo: actions.bottomAnchor, constant: InterfaceMetrics.space2),
+            reload.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -InterfaceMetrics.space4)
+        ])
+        return container
+    }
+
+    private func buildSummaryView() {
+        summaryScroll.hasVerticalScroller = true
+        summaryScroll.drawsBackground = false
+        summaryDocument.translatesAutoresizingMaskIntoConstraints = false
+        summaryStack.orientation = .vertical
+        summaryStack.alignment = .centerX
+        summaryStack.spacing = InterfaceMetrics.space4
+        summaryStack.translatesAutoresizingMaskIntoConstraints = false
+        summaryDocument.addSubview(summaryStack)
+        summaryScroll.documentView = summaryDocument
+        let contentHeight = summaryDocument.heightAnchor.constraint(equalTo: summaryStack.heightAnchor, constant: InterfaceMetrics.space5 * 2)
+        contentHeight.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            summaryDocument.widthAnchor.constraint(equalTo: summaryScroll.contentView.widthAnchor),
+            summaryDocument.heightAnchor.constraint(greaterThanOrEqualTo: summaryScroll.contentView.heightAnchor),
+            summaryStack.widthAnchor.constraint(equalToConstant: InterfaceMetrics.settingsContentWidth),
+            summaryStack.centerXAnchor.constraint(equalTo: summaryDocument.centerXAnchor),
+            summaryStack.topAnchor.constraint(equalTo: summaryDocument.topAnchor, constant: InterfaceMetrics.space5),
+            summaryStack.leadingAnchor.constraint(greaterThanOrEqualTo: summaryDocument.leadingAnchor, constant: InterfaceMetrics.space5),
+            summaryStack.trailingAnchor.constraint(lessThanOrEqualTo: summaryDocument.trailingAnchor, constant: -InterfaceMetrics.space5),
+            summaryStack.bottomAnchor.constraint(lessThanOrEqualTo: summaryDocument.bottomAnchor, constant: -InterfaceMetrics.space5),
+            contentHeight
+        ])
+
+        let (statusCard, statusContent) = makeCard(identifier: "settingsStatusCard", title: "应用状态", explanation: "状态、手动恢复和暂停作用于当前配置档及整个应用。")
+        statusContent.addArrangedSubview(activeProfileLabel)
+        statusContent.addArrangedSubview(stateLabel)
+        evaluationLabel.maximumNumberOfLines = 3
+        statusContent.addArrangedSubview(evaluationLabel)
+        let statusActions = NSStackView(views: [NSButton(title: "刷新显示器状态", target: self, action: #selector(refreshDisplaysClicked)), pauseButton])
+        statusActions.orientation = .horizontal
+        statusActions.spacing = InterfaceMetrics.space2
+        statusContent.addArrangedSubview(statusActions)
         recoverySection.orientation = .vertical
         recoverySection.alignment = .leading
         recoverySection.spacing = InterfaceMetrics.space2
-        recoverySection.addArrangedSubview(makeLabel("安全恢复", style: .section))
+        recoverySection.addArrangedSubview(makeLabel("需要安全恢复", style: .section))
         recoverySection.addArrangedSubview(recoveryNoticeLabel)
         recoverySection.addArrangedSubview(restoreAllButton)
-        root.addArrangedSubview(recoverySection)
-        let actions = NSStackView(views: [manageButton, refreshButton])
-        actions.orientation = .horizontal
-        actions.spacing = InterfaceMetrics.space2
-        manageButton.keyEquivalent = "\r"
-        root.addArrangedSubview(actions)
+        statusContent.addArrangedSubview(recoverySection)
+        summaryStack.addArrangedSubview(statusCard)
+        statusCard.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+
+        let (profileCard, profileContent) = makeCard(identifier: "settingsAutomationCard", title: "所选配置档草稿", explanation: "名称、自动化、定时检查和规则一起保存；编辑未激活配置档不会改变当前显示器。")
+        profileCard.identifier = NSUserInterfaceItemIdentifier("settingsAutomationCard")
+        profileContent.addArrangedSubview(selectedProfileLabel)
+        profileNameField.identifier = NSUserInterfaceItemIdentifier("profileNameField")
+        profileNameField.placeholderString = "配置档名称"
+        profileNameField.widthAnchor.constraint(equalToConstant: InterfaceMetrics.controlWidth * 2).isActive = true
+        let nameRow = NSStackView(views: [makeLabel("名称", style: .secondary), profileNameField])
+        nameRow.orientation = .horizontal
+        nameRow.spacing = InterfaceMetrics.space3
+        profileContent.addArrangedSubview(nameRow)
+        let automaticRow = NSStackView(views: [automaticCheckbox])
+        automaticRow.orientation = .horizontal
+        automaticRow.spacing = InterfaceMetrics.space3
+        profileContent.addArrangedSubview(automaticRow)
+        let pollingRow = NSStackView(views: [pollingCheckbox, makeLabel("间隔", style: .secondary), pollingIntervalField, makeLabel("秒", style: .secondary)])
+        pollingRow.orientation = .horizontal
+        pollingRow.spacing = InterfaceMetrics.space2
+        profileContent.addArrangedSubview(pollingRow)
+        summaryStack.addArrangedSubview(profileCard)
+        profileCard.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+
+        let (rulesCard, rulesContent) = makeCard(identifier: "settingsRulesCard", title: "规则", explanation: "规则矩阵编辑所选配置档的同一份草稿。")
+        rulesContent.addArrangedSubview(rulesSummaryLabel)
+        rulesContent.addArrangedSubview(NSButton(title: "编辑规则…", target: self, action: #selector(openRules)))
+        let (displaysCard, displaysContent) = makeCard(identifier: "settingsDisplaysCard", title: "显示器", explanation: "当前状态、恢复与历史记录属于整个应用。")
+        displaysContent.addArrangedSubview(displaysSummaryLabel)
+        displaysContent.addArrangedSubview(NSButton(title: "管理显示器…", target: self, action: #selector(openDisplays)))
+        let resourceCards = NSStackView(views: [rulesCard, displaysCard])
+        resourceCards.orientation = .horizontal
+        resourceCards.alignment = .top
+        resourceCards.distribution = .fillEqually
+        resourceCards.spacing = InterfaceMetrics.space4
+        rulesCard.heightAnchor.constraint(equalTo: displaysCard.heightAnchor).isActive = true
+        summaryStack.addArrangedSubview(resourceCards)
+        resourceCards.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+
+        let (applicationCard, applicationContent) = makeCard(identifier: "settingsApplicationCard", title: "应用快捷键", explanation: "切换内置显示器的全局快捷键独立于所有显示配置档。")
+        let shortcutRow = NSStackView(views: [shortcutRecorder, resetShortcutButton])
+        shortcutRow.orientation = .horizontal
+        shortcutRow.spacing = InterfaceMetrics.space2
+        applicationContent.addArrangedSubview(shortcutRow)
+        summaryStack.addArrangedSubview(applicationCard)
+        applicationCard.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+
+        saveButton.identifier = NSUserInterfaceItemIdentifier("saveProfileButton")
+        saveAndActivateButton.identifier = NSUserInterfaceItemIdentifier("saveAndActivateProfileButton")
+        let saveActions = NSStackView(views: [saveButton, saveAndActivateButton])
+        saveActions.orientation = .horizontal
+        saveActions.spacing = InterfaceMetrics.space2
+        summaryStack.addArrangedSubview(saveActions)
+
         automaticCheckbox.target = self
         automaticCheckbox.action = #selector(automaticChanged)
         pauseButton.target = self
@@ -240,6 +500,8 @@ final class MainWindowController: NSWindowController {
         pollingCheckbox.action = #selector(pollingChanged)
         pollingIntervalField.target = self
         pollingIntervalField.action = #selector(pollingIntervalChanged)
+        profileNameField.target = self
+        profileNameField.action = #selector(profileNameChanged)
         let formatter = NumberFormatter()
         formatter.minimum = 1
         formatter.maximum = 3600
@@ -251,38 +513,375 @@ final class MainWindowController: NSWindowController {
         shortcutRecorder.onInvalidInput = { [weak self] message in self?.shortcutRecorder.toolTip = message }
         resetShortcutButton.target = self
         resetShortcutButton.action = #selector(resetShortcutClicked)
-        manageButton.target = self
-        manageButton.action = #selector(manageClicked)
-        refreshButton.target = self
-        refreshButton.action = #selector(refreshClicked)
         restoreAllButton.target = self
         restoreAllButton.action = #selector(restoreAllClicked)
+        saveButton.target = self
+        saveButton.action = #selector(saveProfileClicked)
+        saveButton.keyEquivalent = "\r"
+        saveAndActivateButton.target = self
+        saveAndActivateButton.action = #selector(saveAndActivateClicked)
+        pollingIntervalField.widthAnchor.constraint(equalToConstant: InterfaceMetrics.compactControlWidth).isActive = true
+        shortcutRecorder.widthAnchor.constraint(equalToConstant: InterfaceMetrics.controlWidth).isActive = true
+    }
+
+    private func buildDetailView() {
+        let backButton = NSButton(title: "返回配置档", target: self, action: #selector(backToSummary))
+        let header = NSStackView(views: [backButton, detailTitleLabel])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = InterfaceMetrics.space4
+        header.translatesAutoresizingMaskIntoConstraints = false
+        detailHost.translatesAutoresizingMaskIntoConstraints = false
+        detailView.addSubview(header)
+        detailView.addSubview(detailHost)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: InterfaceMetrics.space5),
-            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -InterfaceMetrics.space5),
-            root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: InterfaceMetrics.space5),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -InterfaceMetrics.space5),
-            header.widthAnchor.constraint(equalTo: root.widthAnchor),
-            stateLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
-            evaluationLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
-            pollingIntervalField.widthAnchor.constraint(equalToConstant: InterfaceMetrics.compactControlWidth),
-            shortcutRecorder.widthAnchor.constraint(equalToConstant: InterfaceMetrics.controlWidth)
+            header.leadingAnchor.constraint(equalTo: detailView.leadingAnchor, constant: InterfaceMetrics.space5),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: detailView.trailingAnchor, constant: -InterfaceMetrics.space5),
+            header.topAnchor.constraint(equalTo: detailView.topAnchor, constant: InterfaceMetrics.space4),
+            detailHost.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            detailHost.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            detailHost.topAnchor.constraint(equalTo: header.bottomAnchor, constant: InterfaceMetrics.space4),
+            detailHost.bottomAnchor.constraint(equalTo: detailView.bottomAnchor)
         ])
     }
 
-    @objc private func automaticChanged() {
-        do { try viewModel.setAutomaticEnabled(automaticCheckbox.state == .on) } catch { showPresentationError(error, in: window) }
-        refresh()
+    private func makeCard(identifier: String, title: String, explanation: String?) -> (NSBox, NSStackView) {
+        let card = NSBox()
+        card.identifier = NSUserInterfaceItemIdentifier(identifier)
+        card.boxType = .custom
+        card.borderWidth = 1
+        card.cornerRadius = InterfaceMetrics.space2
+        card.fillColor = .controlBackgroundColor
+        card.borderColor = .separatorColor
+        card.titlePosition = .noTitle
+        card.contentViewMargins = NSSize(width: InterfaceMetrics.space4, height: InterfaceMetrics.space4)
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = InterfaceMetrics.space3
+        content.addArrangedSubview(makeLabel(title, style: .section))
+        if let explanation { content.addArrangedSubview(makeLabel(explanation, style: .secondary)) }
+        card.contentView = content
+        return (card, content)
     }
+
+    private func installContent(_ view: NSView) {
+        for subview in contentContainer.subviews { subview.removeFromSuperview() }
+        view.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            view.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            view.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor)
+        ])
+    }
+
+    private func rebuildProfileEntries() {
+        profileEntries = profileViewModel.profiles.map(ProfileTableEntry.profile)
+            + profileViewModel.invalidProfiles.map(ProfileTableEntry.invalid)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { profileEntries.count }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard profileEntries.indices.contains(row) else { return InterfaceMetrics.space6 }
+        if case .invalid = profileEntries[row] { return InterfaceMetrics.space6 * 3 }
+        return InterfaceMetrics.space6 + InterfaceMetrics.space2
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        guard profileEntries.indices.contains(row) else { return false }
+        if case .profile = profileEntries[row] { return true }
+        return false
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard profileEntries.indices.contains(row) else { return nil }
+        switch profileEntries[row] {
+        case .profile(let profile):
+            let title = makeLabel(profile.name)
+            title.lineBreakMode = .byTruncatingTail
+            title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let indicator = makeLabel(profile.id == profileViewModel.activeProfileID ? "当前" : "", style: .secondary)
+            indicator.textColor = profile.id == profileViewModel.activeProfileID ? NSColor.controlAccentColor : InterfaceColors.secondaryText
+            let stack = NSStackView(views: [title, indicator])
+            stack.orientation = .horizontal
+            stack.spacing = InterfaceMetrics.space2
+            return stack
+        case .invalid(let invalid):
+            let title = makeLabel("错误配置档 · \(invalid.profileName ?? invalid.fileName)", style: .section)
+            title.textColor = InterfaceColors.destructive
+            let detail = makeLabel("\(invalid.fileName)：\(invalid.errorDescription)", style: .secondary)
+            detail.maximumNumberOfLines = 2
+            let restore = InvalidProfileButton(title: "从上次可用版本恢复", target: self, action: #selector(restoreInvalidProfile(_:)))
+            restore.invalidProfile = invalid
+            restore.isHidden = invalid.profileID == nil
+            let remove = InvalidProfileButton(title: "移除此错误文件…", target: self, action: #selector(removeInvalidProfile(_:)))
+            remove.invalidProfile = invalid
+            remove.contentTintColor = InterfaceColors.destructive
+            let actions = NSStackView(views: [restore, remove])
+            actions.orientation = .horizontal
+            actions.spacing = InterfaceMetrics.space2
+            let stack = NSStackView(views: [title, detail, actions])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = InterfaceMetrics.space1
+            return stack
+        }
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !restoringProfileSelection else { return }
+        let row = profileTable.selectedRow
+        guard profileEntries.indices.contains(row), case .profile(let profile) = profileEntries[row] else {
+            restoreProfileSelection()
+            return
+        }
+        guard profile.id != profileViewModel.selectedProfileID else { return }
+        guard resolveDirtyDraft(reason: "切换所选配置档前") else { restoreProfileSelection(); return }
+        do {
+            _ = try profileViewModel.selectProfile(id: profile.id)
+            if activeDetail == .rules { rulesController.refreshFromRuntime() }
+            refresh()
+        } catch {
+            showPresentationError(error, message: "无法打开配置档", in: window)
+            restoreProfileSelection()
+        }
+    }
+
+    private func restoreProfileSelection() {
+        let wasRestoring = restoringProfileSelection
+        restoringProfileSelection = true
+        defer { restoringProfileSelection = wasRestoring }
+        guard let id = profileViewModel.selectedProfileID,
+              let index = profileEntries.firstIndex(where: { if case .profile(let profile) = $0 { return profile.id == id }; return false }) else {
+            profileTable.deselectAll(nil)
+            return
+        }
+        profileTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+    }
+
+    private func dirtyDraftResolution(reason: String) -> ProfileDraftResolution {
+        if let dirtyDraftResolutionProvider { return dirtyDraftResolutionProvider() }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "\(reason)处理未保存修改"
+        alert.informativeText = "“\(profileViewModel.draftProfile?.name ?? "所选配置档")”的名称、自动化、定时检查或规则已修改。"
+        alert.addButton(withTitle: profileViewModel.isSelectedProfileActive ? "保存并应用" : "保存")
+        alert.addButton(withTitle: "不保存")
+        alert.addButton(withTitle: "取消")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .save
+        case .alertSecondButtonReturn: return .discard
+        default: return .cancel
+        }
+    }
+
+    private func resolveDirtyDraft(reason: String) -> Bool {
+        window?.makeFirstResponder(nil)
+        flushDraftFields()
+        do {
+            return try profileViewModel.prepareForExternalProfileActivation { [weak self] in
+                self?.dirtyDraftResolution(reason: reason) ?? .cancel
+            }
+        } catch {
+            showPresentationError(error, message: "无法保存配置档草稿", in: window)
+            return false
+        }
+    }
+
+    private func flushDraftFields() {
+        profileViewModel.setProfileName(profileNameField.stringValue)
+        profileViewModel.setPollingInterval(pollingIntervalField.doubleValue)
+    }
+
+    private func activationConfirmed(_ preview: ProfileActivationPreview) -> Bool {
+        let presentation = PresentationText.profileActivationConfirmation(preview)
+        guard presentation.requiresConfirmation else { return true }
+        let alert = NSAlert()
+        alert.alertStyle = presentation.isCritical ? .critical : .warning
+        alert.messageText = presentation.title
+        alert.informativeText = presentation.explanation
+        alert.addButton(withTitle: presentation.confirmTitle)
+        alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func presentActivationResult(_ result: ProfileActivationResult) {
+        let alert = NSAlert()
+        switch result.hardwareOutcome {
+        case .notNeeded, .applied: alert.alertStyle = .informational
+        case .partiallyFailed: alert.alertStyle = .warning
+        case .failed, .blockedBySafety: alert.alertStyle = .critical
+        }
+        alert.messageText = "当前配置档已更新"
+        alert.informativeText = PresentationText.profileActivationResult(result)
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    private func suggestedProfileName(_ base: String) -> String {
+        var candidate = base
+        var suffix = 2
+        let names = profileViewModel.profiles.map(\.name)
+        while names.contains(where: { DisplayProfile.namesAreEqual($0, candidate) }) {
+            candidate = "\(base) \(suffix)"
+            suffix += 1
+        }
+        return candidate
+    }
+
+    private func askProfileName(message: String, suggestion: String, firstButton: String, secondButton: String? = nil) -> (String, NSApplication.ModalResponse)? {
+        let alert = NSAlert()
+        alert.messageText = message
+        let field = NSTextField(string: suggestion)
+        field.placeholderString = "配置档名称"
+        field.frame = NSRect(origin: .zero, size: NSSize(width: InterfaceMetrics.controlWidth * 2, height: InterfaceMetrics.space5))
+        alert.accessoryView = field
+        alert.addButton(withTitle: firstButton)
+        if let secondButton { alert.addButton(withTitle: secondButton) }
+        alert.addButton(withTitle: "取消")
+        let response = alert.runModal()
+        let cancelResponse: NSApplication.ModalResponse = secondButton == nil ? .alertSecondButtonReturn : .alertThirdButtonReturn
+        guard response != cancelResponse else { return nil }
+        return (field.stringValue, response)
+    }
+
+    @objc private func newProfileClicked() {
+        guard resolveDirtyDraft(reason: "新建配置档前") else { return }
+        guard let answer = askProfileName(message: "新建显示配置档", suggestion: suggestedProfileName("新配置档"), firstButton: "新建空白配置档", secondButton: "复制当前配置档") else { return }
+        do {
+            if answer.1 == .alertFirstButtonReturn { _ = try profileViewModel.createBlankProfile(named: answer.0) }
+            else { _ = try profileViewModel.createProfileCopy(named: answer.0) }
+            showSummary()
+            refresh()
+        } catch { showPresentationError(error, message: "无法新建配置档", in: window) }
+    }
+
+    @objc private func duplicateProfileClicked() {
+        guard let profile = profileViewModel.draftProfile, resolveDirtyDraft(reason: "复制配置档前") else { return }
+        guard let answer = askProfileName(message: "复制“\(profile.name)”", suggestion: suggestedProfileName("\(profile.name) 副本"), firstButton: "复制") else { return }
+        do { _ = try profileViewModel.duplicateSelectedProfile(named: answer.0); showSummary(); refresh() }
+        catch { showPresentationError(error, message: "无法复制配置档", in: window) }
+    }
+
+    @objc private func deleteProfileClicked() {
+        _ = deleteSelectedProfile()
+    }
+
+    @discardableResult
+    func deleteSelectedProfile(
+        confirm: ((DisplayProfile) -> Bool)? = nil
+    ) -> Bool {
+        guard resolveDirtyDraft(reason: "删除配置档前") else { return false }
+        do {
+            let confirmationProfile = try selectedPersistedProfileForDeletion()
+            let isConfirmed: Bool
+            if let confirm {
+                isConfirmed = confirm(confirmationProfile)
+            } else {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "删除“\(confirmationProfile.name)”？"
+                alert.informativeText = "只会删除这个未激活配置档及其上次可用备份，不会激活其他配置档或操作显示器。"
+                alert.addButton(withTitle: "删除")
+                alert.addButton(withTitle: "取消")
+                isConfirmed = alert.runModal() == .alertFirstButtonReturn
+            }
+            guard isConfirmed else { return false }
+
+            let deletionProfile = try selectedPersistedProfileForDeletion()
+            guard deletionProfile.id == confirmationProfile.id,
+                  deletionProfile.name == confirmationProfile.name else {
+                throw PresentationError.staleProfileDraft
+            }
+            try profileViewModel.deleteSelectedProfile()
+            showSummary()
+            refresh()
+            return true
+        } catch {
+            showPresentationError(error, message: "无法删除配置档", in: window)
+            return false
+        }
+    }
+
+    private func selectedPersistedProfileForDeletion() throws -> DisplayProfile {
+        guard !profileViewModel.isDirty,
+              let selectedID = profileViewModel.selectedProfileID,
+              let profile = profileViewModel.profiles.first(where: { $0.id == selectedID }) else {
+            throw PresentationError.staleProfileDraft
+        }
+        guard selectedID != profileViewModel.activeProfileID else {
+            throw ConfigurationStoreError.cannotDeleteActiveProfile
+        }
+        return profile
+    }
+
+    @objc private func reloadProfilesClicked() {
+        guard resolveDirtyDraft(reason: "重新加载配置档前") else { return }
+        do {
+            let status = try profileViewModel.reloadProfileCatalog()
+            let settingsNotices = PresentationText.applicationSettingsReloadNotices(status: status)
+            refresh()
+            presentApplicationSettingsReloadNotices(settingsNotices)
+            guard !settingsNotices.contains(where: { $0.blocksProfileReloadApply }) else { return }
+            guard let externalID = profileViewModel.externalActiveProfileID else { return }
+            let externalName = profileViewModel.profiles.first(where: { $0.id == externalID })?.name ?? externalID.uuidString
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "磁盘上的当前配置档已变化"
+            alert.informativeText = "磁盘指向或修改了“\(externalName)”。重新加载并应用会读取磁盘版本、更新当前配置档并立即评估；保留当前状态不会操作显示器，磁盘差异仍会保留。"
+            alert.addButton(withTitle: "重新加载并应用")
+            alert.addButton(withTitle: "保留当前状态")
+            if alert.runModal() == .alertFirstButtonReturn {
+                guard let preview = try profileViewModel.previewExternalProfileReload(), activationConfirmed(preview) else { return }
+                presentActivationResult(
+                    try profileViewModel.reloadAndApplyExternalProfile(confirmedPreview: preview)
+                )
+            } else {
+                profileViewModel.keepCurrentProfileAfterExternalDrift()
+            }
+            refresh()
+        } catch { showPresentationError(error, message: "无法重新加载配置档", in: window) }
+    }
+
+    private func presentApplicationSettingsReloadNotices(
+        _ notices: [ApplicationSettingsReloadNoticePresentation]
+    ) {
+        guard !notices.isEmpty else { return }
+        let alert = NSAlert()
+        alert.alertStyle = notices.contains(where: { $0.severity == .critical }) ? .critical : .warning
+        alert.messageText = notices.count == 1 ? notices[0].title : "磁盘应用设置需要处理"
+        alert.informativeText = notices.map { "\($0.title)\n\($0.explanation)" }.joined(separator: "\n\n")
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    @objc private func restoreInvalidProfile(_ sender: InvalidProfileButton) {
+        guard let invalid = sender.invalidProfile else { return }
+        do { _ = try profileViewModel.restoreInvalidProfile(invalid); refresh() }
+        catch { showPresentationError(error, message: "无法从上次可用版本恢复", in: window) }
+    }
+
+    @objc private func removeInvalidProfile(_ sender: InvalidProfileButton) {
+        guard let invalid = sender.invalidProfile else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "移除错误文件“\(invalid.fileName)”？"
+        alert.informativeText = "只会移除列表中这个精确文件；不会自动修复、重命名或删除其他错误条目。若同一标识有上次可用备份，也会一并移除。"
+        alert.addButton(withTitle: "移除精确文件")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do { _ = try profileViewModel.removeInvalidProfile(invalid); refresh() }
+        catch { showPresentationError(error, message: "无法移除错误配置档", in: window) }
+    }
+
+    @objc private func profileNameChanged() { profileViewModel.setProfileName(profileNameField.stringValue); refresh() }
+    @objc private func automaticChanged() { profileViewModel.setAutomaticEnabled(automaticCheckbox.state == .on); refresh() }
+    @objc private func pollingChanged() { profileViewModel.setPollingEnabled(pollingCheckbox.state == .on); refresh() }
+    @objc private func pollingIntervalChanged() { profileViewModel.setPollingInterval(pollingIntervalField.doubleValue); refresh() }
     @objc private func pauseClicked() { viewModel.togglePause(); refresh() }
-    @objc private func pollingChanged() {
-        do { try viewModel.setPollingEnabled(pollingCheckbox.state == .on) } catch { showPresentationError(error, in: window) }
-        refresh()
-    }
-    @objc private func pollingIntervalChanged() {
-        do { try viewModel.setPollingInterval(pollingIntervalField.doubleValue) } catch { showPresentationError(error, in: window) }
-        refresh()
-    }
     @objc private func startShortcutRecording() { shortcutRecorder.beginRecording() }
     private func recordShortcut(_ shortcut: KeyShortcut) {
         guard shortcutSetter(shortcut) else {
@@ -300,115 +899,43 @@ final class MainWindowController: NSWindowController {
         }
         refresh()
     }
-    @objc private func manageClicked() { onOpenManagement() }
-    @objc private func refreshClicked() {
-        do { try viewModel.refresh() } catch { showPresentationError(error, in: window) }
-        refresh()
+    @objc private func refreshDisplaysClicked() { do { try viewModel.refresh() } catch { showPresentationError(error, in: window) }; refresh() }
+    @objc private func restoreAllClicked() { runDisplayRecoveryFlow(runtime: viewModel.runtime, in: window); refresh() }
+    @objc private func saveProfileClicked() {
+        flushDraftFields()
+        do { _ = try profileViewModel.saveSelectedProfile(); refresh() }
+        catch { showPresentationError(error, message: "无法保存配置档", in: window) }
     }
-    @objc private func restoreAllClicked() {
-        runDisplayRecoveryFlow(runtime: viewModel.runtime, in: window)
-        refresh()
+    @objc private func saveAndActivateClicked() {
+        flushDraftFields()
+        do {
+            _ = try profileViewModel.saveSelectedProfile()
+            let preview = try profileViewModel.previewSelectedProfileActivation()
+            guard activationConfirmed(preview) else { refresh(); return }
+            presentActivationResult(try profileViewModel.activateSelectedProfile(confirmedPreview: preview))
+            refresh()
+        } catch { showPresentationError(error, message: "无法保存并激活配置档", in: window) }
     }
-}
-
-final class ManagementWindowController: NSWindowController, NSWindowDelegate {
-    enum Page: Int { case rules, displays }
-    private let navigation = NSSegmentedControl(labels: ["自动规则", "显示器"], trackingMode: .selectOne, target: nil, action: nil)
-    private let pageContainer = NSView()
-    private let rootController = NSViewController()
-    let rulesController: RulesPageViewController
-    let displaysController: DisplaysPageViewController
-    private var selectedPage: Page = .rules
-
-    init(runtime: DisplayManagingRuntime, onLastActiveSafetyBlock: @escaping () -> Void) {
-        rulesController = RulesPageViewController(runtime: runtime)
-        displaysController = DisplaysPageViewController(runtime: runtime, onLastActiveSafetyBlock: onLastActiveSafetyBlock)
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: InterfaceMetrics.managementWindowSize), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Display Steward 管理"
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.minSize = InterfaceMetrics.managementWindowSize
-        super.init(window: window)
-        buildView()
-        window.delegate = self
-        showPage(.rules)
-    }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    func show(page: Page = .rules) {
-        showPage(page)
-        refresh()
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-    func refresh() { rulesController.refreshFromRuntime(); displaysController.refreshFromRuntime() }
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard rulesController.viewModel.isDirty else { return true }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "放弃未保存的规则修改？"
-        alert.informativeText = "关闭管理窗口会丢弃尚未“保存并应用”的规则修改。"
-        alert.addButton(withTitle: "继续编辑")
-        alert.addButton(withTitle: "放弃修改")
-        if alert.runModal() == .alertSecondButtonReturn { rulesController.viewModel.reloadFromRuntime(); return true }
-        return false
-    }
-    private func buildView() {
-        let root = NSView()
-        rootController.view = root
-        window?.contentViewController = rootController
-        navigation.selectedSegment = selectedPage.rawValue
-        navigation.target = self
-        navigation.action = #selector(navigationChanged)
-        navigation.translatesAutoresizingMaskIntoConstraints = false
-        pageContainer.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(navigation)
-        root.addSubview(pageContainer)
-        rootController.addChild(rulesController)
-        rootController.addChild(displaysController)
-        NSLayoutConstraint.activate([
-            navigation.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: InterfaceMetrics.space5),
-            navigation.topAnchor.constraint(equalTo: root.topAnchor, constant: InterfaceMetrics.space4),
-            pageContainer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            pageContainer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            pageContainer.topAnchor.constraint(equalTo: navigation.bottomAnchor, constant: InterfaceMetrics.space4),
-            pageContainer.bottomAnchor.constraint(equalTo: root.bottomAnchor)
-        ])
-    }
-    @objc private func navigationChanged() { if let page = Page(rawValue: navigation.selectedSegment) { showPage(page) } }
-    private func showPage(_ page: Page) {
-        selectedPage = page
-        navigation.selectedSegment = page.rawValue
-        for subview in pageContainer.subviews { subview.removeFromSuperview() }
-        let controller = page == .rules ? rulesController : displaysController
-        let pageView = controller.view
-        pageView.translatesAutoresizingMaskIntoConstraints = false
-        pageContainer.addSubview(pageView)
-        NSLayoutConstraint.activate([
-            pageView.leadingAnchor.constraint(equalTo: pageContainer.leadingAnchor),
-            pageView.trailingAnchor.constraint(equalTo: pageContainer.trailingAnchor),
-            pageView.topAnchor.constraint(equalTo: pageContainer.topAnchor),
-            pageView.bottomAnchor.constraint(equalTo: pageContainer.bottomAnchor)
-        ])
-    }
+    @objc private func openRules() { showDetail(.rules) }
+    @objc private func openDisplays() { showDetail(.displays) }
+    @objc private func backToSummary() { showSummary(); refresh() }
 }
 
 private final class TargetPopUpButton: NSPopUpButton { var representedTargets: [DisplayTarget] = [] }
 private final class ActionPopUpButton: NSPopUpButton { var representedTarget: DisplayTarget? }
 
 final class RulesPageViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
-    let viewModel: RulesEditorViewModel
+    let viewModel: ProfileManagementViewModel
     private let tableView = NSTableView()
-    private let editorStack = NSStackView()
+    private let editorStack = FlippedStackView()
     private let previewLabel = makeLabel("尚未预览。预览不会更改配置或显示器状态。", style: .secondary)
     private let previewButton = NSButton(title: "预览", target: nil, action: nil)
-    private let saveButton = NSButton(title: "保存并应用", target: nil, action: nil)
     private let restoreButton = NSButton(title: "恢复两条默认规则…", target: nil, action: nil)
     private let duplicateButton = NSButton(title: "复制", target: nil, action: nil)
     private let deleteButton = NSButton(title: "删除", target: nil, action: nil)
     private let pasteboardType = NSPasteboard.PasteboardType("com.anhoder.display-steward.rule-row")
 
-    init(runtime: DisplayManagingRuntime) { viewModel = RulesEditorViewModel(runtime: runtime); super.init(nibName: nil, bundle: nil) }
+    init(viewModel: ProfileManagementViewModel) { self.viewModel = viewModel; super.init(nibName: nil, bundle: nil) }
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func loadView() {
@@ -424,7 +951,8 @@ final class RulesPageViewController: NSViewController, NSTableViewDataSource, NS
     }
     func refreshFromRuntime() {
         if isViewLoaded, view.window?.isVisible == true, view.window?.firstResponder is NSTextView { return }
-        if viewModel.isDirty { viewModel.synchronizeHistory(); viewModel.synchronizeActionMatrix() } else { viewModel.reloadFromRuntime() }
+        viewModel.refreshFromRuntime()
+        if viewModel.isDirty { viewModel.synchronizeActionMatrix() }
         guard isViewLoaded else { return }
         tableView.reloadData()
         selectCurrentRule()
@@ -494,8 +1022,8 @@ final class RulesPageViewController: NSViewController, NSTableViewDataSource, NS
         duplicateButton.isEnabled = viewModel.selectedRule != nil
         deleteButton.isEnabled = viewModel.selectedRule != nil
         guard let rule = viewModel.selectedRule else {
-            editorStack.addArrangedSubview(makeLabel("没有自动规则", style: .title))
-            editorStack.addArrangedSubview(makeLabel("可以保留空的全局规则列表。保存后不会自动恢复默认规则；也可以新建规则或恢复两条默认规则。", style: .secondary))
+            editorStack.addArrangedSubview(makeLabel("没有规则", style: .title))
+            editorStack.addArrangedSubview(makeLabel("所选配置档可以保留空规则列表。返回配置档保存前不会写入；也可以新建规则或恢复两条默认规则到同一草稿。", style: .secondary))
             addEditorFooter(); return
         }
         editorStack.addArrangedSubview(makeLabel("编辑规则", style: .title))
@@ -621,10 +1149,10 @@ final class RulesPageViewController: NSViewController, NSTableViewDataSource, NS
         previewLabel.maximumNumberOfLines = 4
         previewLabel.stringValue = viewModel.lastPreview.map(PresentationText.previewSummary) ?? "尚未预览。预览只读取当前快照，不会保存配置或更改显示器状态。"
         editorStack.addArrangedSubview(previewLabel)
+        editorStack.addArrangedSubview(makeLabel("规则与名称、自动化和定时检查属于同一配置档草稿；请返回配置档统一保存。", style: .secondary))
         restoreButton.target = self; restoreButton.action = #selector(restoreDefaults); restoreButton.contentTintColor = InterfaceColors.destructive
         previewButton.target = self; previewButton.action = #selector(previewRules)
-        saveButton.target = self; saveButton.action = #selector(saveAndApply); saveButton.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [restoreButton, previewButton, saveButton]); buttons.orientation = .horizontal; buttons.spacing = InterfaceMetrics.space2
+        let buttons = NSStackView(views: [restoreButton, previewButton]); buttons.orientation = .horizontal; buttons.spacing = InterfaceMetrics.space2
         editorStack.addArrangedSubview(buttons)
     }
     func numberOfRows(in tableView: NSTableView) -> Int { viewModel.draftConfiguration.rules.count }
@@ -665,7 +1193,7 @@ final class RulesPageViewController: NSViewController, NSTableViewDataSource, NS
     }
     @objc private func deleteRule() {
         guard viewModel.selectedRule != nil else { return }
-        let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "删除这条规则？"; alert.informativeText = "删除会保留其他规则与所有应用设置；在“保存并应用”之前不会写入配置。"; alert.addButton(withTitle: "删除"); alert.addButton(withTitle: "取消")
+        let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "删除这条规则？"; alert.informativeText = "删除只会修改所选配置档草稿；返回配置档保存前不会写入。"; alert.addButton(withTitle: "删除"); alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         viewModel.deleteSelectedRule(); tableView.reloadData(); selectCurrentRule(); rebuildEditor()
     }
@@ -735,15 +1263,12 @@ final class RulesPageViewController: NSViewController, NSTableViewDataSource, NS
     @objc private func previewRules() {
         do { previewLabel.stringValue = PresentationText.previewSummary(try viewModel.preview()) } catch { showPresentationError(error, message: "无法预览规则", in: view.window) }
     }
-    @objc private func saveAndApply() {
-        do { _ = try viewModel.saveAndApply(); tableView.reloadData(); selectCurrentRule(); rebuildEditor() } catch { showPresentationError(error, message: "无法保存并应用规则", in: view.window) }
-    }
     @objc private func restoreDefaults() {
         do {
             let candidate = try viewModel.defaultRulesCandidate()
-            let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "恢复两条默认规则？"; alert.informativeText = "将仅替换自动规则，不会重置自动开关、轮询、快捷键、显示器历史或别名。\n\n预览：\(PresentationText.previewSummary(candidate.preview))"; alert.addButton(withTitle: "恢复并应用"); alert.addButton(withTitle: "取消")
+            let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "恢复两条默认规则到草稿？"; alert.informativeText = "将仅替换所选配置档草稿中的规则，不会重置自动化、定时检查、全局快捷键、显示器历史或别名，也不会立即应用。\n\n预览：\(PresentationText.previewSummary(candidate.preview))"; alert.addButton(withTitle: "替换草稿规则"); alert.addButton(withTitle: "取消")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
-            _ = try viewModel.applyDefaultRulesCandidate(candidate.configuration); tableView.reloadData(); selectCurrentRule(); rebuildEditor()
+            try viewModel.useDefaultRulesCandidate(candidate.profile); tableView.reloadData(); selectCurrentRule(); rebuildEditor()
         } catch { showPresentationError(error, message: "无法恢复默认规则", in: view.window) }
     }
     private func kindIndex(_ condition: RuleCondition) -> Int { switch condition { case .always: return 0; case .count: return 1; case .exactState: return 2; case .familyState: return 3 } }
@@ -761,7 +1286,7 @@ final class DisplaysPageViewController: NSViewController, NSTableViewDataSource,
     let viewModel: DisplaysViewModel
     private let onLastActiveSafetyBlock: () -> Void
     private let tableView = NSTableView()
-    private let detailStack = NSStackView()
+    private let detailStack = FlippedStackView()
     private let restoreAllButton = NSButton(title: PresentationText.restoreAllTitle, target: nil, action: nil)
     private let recoveryExplanation = makeLabel("", style: .secondary)
     private var entries: [DisplayTableEntry] = []
@@ -832,7 +1357,7 @@ final class DisplaysPageViewController: NSViewController, NSTableViewDataSource,
         detailStack.addArrangedSubview(makeLabel("可观察详情", style: .section)); detailStack.addArrangedSubview(detailGrid(for: row))
         if let action = row.manualAction, let actionTitle = row.manualActionTitle {
             let button = DisplayActionButton(title: actionTitle, target: self, action: #selector(manualActionClicked(_:))); button.rowID = row.id; if action == .disable { button.contentTintColor = InterfaceColors.destructive }; detailStack.addArrangedSubview(button)
-            detailStack.addArrangedSubview(makeLabel("手动操作使用与自动规则相同的安全检查，并会暂停自动化。", style: .secondary))
+            detailStack.addArrangedSubview(makeLabel("手动操作使用与规则执行相同的安全检查，并会暂停自动化。", style: .secondary))
         } else { detailStack.addArrangedSubview(makeLabel("此历史记录当前没有可执行的手动操作。", style: .secondary)) }
         if row.isHistorical {
             let forget = DisplayActionButton(title: "遗忘此历史显示器…", target: self, action: #selector(forgetClicked(_:))); forget.rowID = row.id; forget.isEnabled = row.canForget; forget.contentTintColor = InterfaceColors.destructive
