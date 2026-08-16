@@ -58,8 +58,15 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
           codesign --force --deep --sign - "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "Display-Steward-$VERSION.zip"
+          DMG_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/display-steward-dmg.XXXXXX")
+          cp -R "$APP" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create -volname "Display Steward" -srcfolder "$DMG_STAGE" -ov -format UDZO "Display-Steward-$VERSION.dmg"
+          rm -rf "$DMG_STAGE"
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
-          files: Display-Steward-*.zip
+          files: |
+            Display-Steward-*.zip
+            Display-Steward-*.dmg
           generate_release_notes: true
