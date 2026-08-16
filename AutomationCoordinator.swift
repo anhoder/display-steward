@@ -1865,6 +1865,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         if updateDisplayHistory(from: snapshot) {
             snapshot = try adapter.observe(configuration: configuration, runtimeState: runtimeState)
         }
+        seedDefaultExternalRulesIfNeeded(snapshot: snapshot)
         currentStatus.recoveryPlan = recoveryPlan(for: snapshot)
         return snapshot
     }
@@ -1905,6 +1906,41 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         }
 
         return changed
+    }
+
+    /// A fresh install starts with an empty default Profile and Automation off.
+    /// The built-in display target is only knowable once the first observation
+    /// reports it, so on that observation the two default external-display rules
+    /// are seeded into the pristine Profile and persisted. Automation stays off;
+    /// the rules are inert until the user enables it.
+    private func seedDefaultExternalRulesIfNeeded(snapshot: ObservedDisplaySnapshot) {
+        guard runtimeStateIsWritable,
+              activeProfileIsWritable,
+              currentStatus.configurationLoadSource == .createdBlankProfile,
+              let profile = activeProfile,
+              profile.rules.isEmpty,
+              let builtIn = snapshot.displays.first(where: {
+                  $0.isBuiltIn && $0.state.isOnline && $0.family.isValid
+              }) else { return }
+        let target: DisplayTarget = builtIn.stableIdentity.map(DisplayTarget.exact)
+            ?? .family(builtIn.family)
+
+        var seeded = profile
+        seeded.rules = LegacyConfigurationMigrator.defaultExternalRules(target: target)
+        do {
+            try seeded.validate()
+            try configurationStore.saveProfile(seeded)
+            markActiveProfilePersistedPrimary(seeded)
+            configuration = AppConfiguration(
+                settings: configuration.applicationSettings(activeProfileID: seeded.id),
+                profile: seeded
+            )
+            currentStatus.configuration = configuration
+            refreshCatalogStatus()
+            log("[RULES] seeded the default external-display rules into the fresh default profile")
+        } catch {
+            log("[RULES] could not seed the default external-display rules: \(error.localizedDescription)")
+        }
     }
 
     private func recoveryPlan(for snapshot: ObservedDisplaySnapshot) -> DisplayRecoveryPlan {

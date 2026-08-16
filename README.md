@@ -1,111 +1,113 @@
 <p align="center">
-  <img src="Assets/DisplaySteward.svg" width="144" alt="Display Steward 图标">
+  <img src="Assets/DisplaySteward.svg" width="144" alt="Display Steward icon">
 </p>
 
 # Display Steward
 
-Display Steward 是一个原生 macOS 菜单栏工具，用显式规则管理显示器启停状态。它支持为办公室、家里等使用方式创建多个 Display Profile，同时保留手动控制、恢复证据和最后活动屏保护。
+[中文](README.cn.md) | **English**
 
-## 功能
+Display Steward is a native macOS menu bar app that manages display enable/disable state with explicit rules. It supports creating multiple Display Profiles for different usage contexts such as the office or home, while preserving manual control, recovery evidence, and last-active-display protection.
 
-- **Display Profiles**：每个 Profile 独立保存名称、自动化设置、轮询配置和规则。
-- **手动激活**：Profile 不会根据地点或显示器自动切换；用户从 Settings 或状态栏明确选择。
-- **规则引擎**：按在线/活动显示器数量和具体设备状态匹配规则，并通过优先级合并动作。
-- **安全切换**：激活前使用最新显示器拓扑预览；涉及关闭显示器或安全警告时要求确认。
-- **最后活动屏保护**：阻止规则或手动操作关闭最后一台可用显示器。
-- **可恢复状态**：记录由应用发起但尚未确认完成的禁用和恢复操作。
-- **手动控制**：状态栏可开启、关闭或恢复受管显示器。
-- **全局快捷键**：默认 `⌃⌥⇧D`，用于切换内建显示器，可在 Settings 中修改。
+## Features
 
-Display Steward 只管理显示器启用和停用，不修改主屏、排列、分辨率、刷新率、缩放、HDR 或色彩配置。
+- **Display Profiles**: Each profile independently stores its name, automation settings, polling configuration, and rules.
+- **Manual activation**: Profiles are never switched automatically based on location or display topology; the user explicitly selects one from Settings or the menu bar.
+- **Rule engine**: Matches rules against the count of online/active displays and specific device state, then merges actions by priority.
+- **Safe switching**: Previews the latest display topology before activating; requires confirmation for actions that disable displays or raise safety warnings.
+- **Last-active-display protection**: Prevents rules or manual actions from disabling the last usable display.
+- **Recoverable state**: Records disable and restore operations initiated by the app that have not yet been confirmed complete.
+- **Manual control**: The menu bar can enable, disable, or restore managed displays.
+- **Global hotkey**: Default `⌃⌥⇧D` toggles the built-in display; configurable in Settings.
 
-## 系统要求
+Display Steward only manages display enable/disable state. It does not modify the main display, arrangement, resolution, refresh rate, scaling, HDR, or color configuration.
 
-- macOS 13 或更高版本
-- Xcode Command Line Tools，提供 `swiftc`、`codesign`、`plutil`
+## System Requirements
 
-项目直接使用 `swiftc` 和系统 Framework 构建，不依赖 Swift Package Manager 或第三方运行时库。
+- macOS 13 or later
+- Xcode Command Line Tools, providing `swiftc`, `codesign`, `plutil`
 
-## 快速开始
+The project builds directly with `swiftc` and system frameworks; it does not depend on Swift Package Manager or third-party runtime libraries.
 
-### 本地构建
+## Quick Start
+
+### Build locally
 
 ```sh
 ./build.sh
 ```
 
-应用生成于：
+The app is produced at:
 
 ```text
 build/Display Steward.app
 ```
 
-### 安装并启动
+### Install and launch
 
 ```sh
 ./install.sh
 ```
 
-安装脚本会：
+The install script:
 
-1. 构建并签名应用；
-2. 停止旧的 Display Steward / Screen Manager 进程与 LaunchAgent；
-3. 迁移兼容的旧配置目录；
-4. 安装并启动 `com.anhoder.display-steward` LaunchAgent。
+1. Builds and signs the app;
+2. Stops old Display Steward / Screen Manager processes and LaunchAgents;
+3. Migrates compatible legacy configuration directories;
+4. Installs and starts the `com.anhoder.display-steward` LaunchAgent.
 
-### 无副作用安装检查
+### Side-effect-free install check
 
 ```sh
 ./install.sh --smoke-test
 ```
 
-该模式只验证构建、Bundle、plist 和代码签名，不修改 LaunchAgent、进程、配置或显示器状态。
+This mode only verifies the build, bundle, plist, and code signature. It does not touch LaunchAgents, processes, configuration, or display state.
 
-## 使用
+## Usage
 
-1. 从菜单栏打开 **Display Steward → 打开设置…**。
-2. 在 Profile 列表中新建空白 Profile，或复制现有 Profile。
-3. 编辑名称、自动化、轮询和规则。
-4. 使用 **保存**、**保存并激活** 或 **保存并应用** 明确提交。
-5. 也可以从状态栏的 **配置档** 子菜单快速激活已保存的 Profile。
+1. Open **Display Steward → Open Settings…** from the menu bar.
+2. In the Profiles list, create a blank profile or duplicate an existing one.
+3. Edit the name, automation, polling, and rules.
+4. Commit explicitly with **Save**, **Save and Activate**, or **Save and Apply**.
+5. You can also quickly activate a saved profile from the **Profiles** submenu in the menu bar.
 
-Settings 会分别标记“正在编辑”和“当前激活”的 Profile。单击列表只切换编辑对象，不会改变显示器状态。未保存修改在切换、关闭、退出或状态栏操作前都会经过保存、放弃或取消确认。
+Settings marks the profiles currently being edited and currently active separately. Clicking the list only switches the editing target; it never changes display state. Unsaved changes go through a Save, Discard, or Cancel confirmation before switching, closing, quitting, or a menu bar action.
 
-## 配置文件
+## Configuration Files
 
-默认配置根目录：
+Default configuration root:
 
 ```text
 ~/.config/display-steward/
-├── config.json                         # 全局热键、显示器历史、Active Profile ID
-├── config.last-good.json               # 全局设置安全代次
-├── runtime-state.json                  # 当前启动周期的恢复证据
+├── config.json                         # Global hotkey, display history, active profile ID
+├── config.last-good.json               # Safe generation of global settings
+├── runtime-state.json                  # Recovery evidence for the current launch
 └── profiles/
-    ├── <uuid>.json                     # Profile 正式文件
+    ├── <uuid>.json                     # Canonical profile files
     └── last-good/
-        └── <uuid>.json                 # Profile 安全代次
+        └── <uuid>.json                 # Safe generations of profiles
 ```
 
-配置损坏时，应用只会尝试同一设置或 Profile 的最后有效代次，不会自动选择其他 Profile，也不会静默覆盖损坏文件。
+If configuration is corrupt, the app only falls back to the last-good generation of the same settings or profile. It never silently selects another profile and never silently overwrites a corrupt file.
 
-## 开发与验证
+## Development and Verification
 
-运行完整测试：
+Run the full test suite:
 
 ```sh
 ./test-all.sh
 ```
 
-测试分层：
+Test phases:
 
-| 阶段 | 范围 |
+| Phase | Scope |
 | --- | --- |
-| Phase 1 | 领域模型、规则求值、配置存储与迁移 |
-| Phase 2 | 显示器清单、动作事务、自动化与恢复生命周期 |
-| Phase 3 | Presentation、Profile 草稿与 AppKit 管理界面 |
-| Phase 4 | 启动、迁移、状态栏和端到端集成 |
+| Phase 1 | Domain model, rule evaluation, configuration storage and migration |
+| Phase 2 | Display inventory, action transactions, automation and recovery lifecycle |
+| Phase 3 | Presentation, profile drafts, and the AppKit management UI |
+| Phase 4 | Launch, migration, menu bar, and end-to-end integration |
 
-单独运行某一阶段：
+Run a single phase:
 
 ```sh
 ./test-phase1.sh
@@ -114,30 +116,34 @@ Settings 会分别标记“正在编辑”和“当前激活”的 Profile。单
 ./test-phase4.sh
 ```
 
-提交改动前建议运行：
+Before committing changes, it is recommended to run:
 
 ```sh
 ./test-all.sh
 ./install.sh --smoke-test
 ```
 
-更多开发约束见 [CONTRIBUTING.md](CONTRIBUTING.md)。领域语言和架构决策分别记录在 [CONTEXT.md](CONTEXT.md)、[SOUL.md](SOUL.md) 和 [`docs/adr/`](docs/adr/)。
+See [CONTRIBUTING.md](CONTRIBUTING.md) for further development constraints. Domain language and architecture decisions are recorded in [CONTEXT.md](CONTEXT.md), [SOUL.md](SOUL.md), and [`docs/adr/`](docs/adr/).
 
-## 主要模块
+## Main Modules
 
-| 文件 | 职责 |
+| File | Responsibility |
 | --- | --- |
-| `DisplaySteward.swift` | 应用入口、状态栏、全局快捷键和 AppKit 生命周期 |
-| `AutomationCoordinator.swift` | 自动化调度、Profile 激活、动作重试和恢复协调 |
-| `RuleModel.swift` | 显示器、规则、Profile 和全局设置模型 |
-| `RuleEvaluator.swift` | 条件匹配、优先级合并和最后活动屏保护 |
-| `ConfigurationStore.swift` | 分离式配置持久化、回退、迁移和 Profile 生命周期 |
-| `RuntimeStateStore.swift` | 当前启动周期的禁用与恢复证据 |
-| `AppPresentation.swift` | 用户可见状态和交互文案 |
-| `ManagementUI.swift` | Settings、Profile、规则和显示器管理界面 |
+| `DisplaySteward.swift` | App entry point, menu bar, global hotkey, and AppKit lifecycle |
+| `AutomationCoordinator.swift` | Automation scheduling, profile activation, action retries, and recovery coordination |
+| `RuleModel.swift` | Display, rule, profile, and global settings models |
+| `RuleEvaluator.swift` | Condition matching, priority merging, and last-active-display protection |
+| `ConfigurationStore.swift` | Split configuration persistence, fallback, migration, and profile lifecycle |
+| `RuntimeStateStore.swift` | Disable and restore evidence for the current launch |
+| `AppPresentation.swift` | User-visible state and interaction copy |
+| `ManagementUI.swift` | Settings, profile, rule, and display management UI |
 
-## 安全说明
+## Safety Notes
 
-显示器启停依赖动态解析的私有 CoreGraphics SPI `CGSConfigureDisplayEnabled`。应用将其限制在事务适配器内，并在每次操作前后验证显示器拓扑与结果，但系统升级仍可能改变该接口行为。
+Display enable/disable relies on the private CoreGraphics SPI `CGSConfigureDisplayEnabled`, resolved dynamically. The app confines it to a transaction adapter and verifies display topology and results before and after every operation, but macOS releases may still change this interface's behavior.
 
-修改真实显示器状态前，请确保至少保留一台可用显示器。自动化、恢复和手动操作都必须继续满足最后活动屏安全约束。
+Before modifying real display state, make sure at least one usable display remains. Automation, recovery, and manual operations must all continue to satisfy the last-active-display safety constraint.
+
+## License
+
+[MIT](LICENSE) © 2026 anhoder

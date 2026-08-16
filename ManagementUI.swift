@@ -525,7 +525,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
     }
 
     private func buildDetailView() {
-        let backButton = NSButton(title: "返回配置档", target: self, action: #selector(backToSummary))
+        let backButton = NSButton(
+            image: NSImage(systemSymbolName: "chevron.left", accessibilityDescription: "返回配置档") ?? NSImage(),
+            target: self,
+            action: #selector(backToSummary)
+        )
+        backButton.isBordered = false
+        backButton.imagePosition = .imageOnly
+        backButton.contentTintColor = .controlAccentColor
+        backButton.setAccessibilityLabel("返回配置档")
         let header = NSStackView(views: [backButton, detailTitleLabel])
         header.orientation = .horizontal
         header.alignment = .centerY

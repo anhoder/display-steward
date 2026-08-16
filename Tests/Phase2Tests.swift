@@ -1294,7 +1294,7 @@ private enum Phase2Tests {
             try expect(persisted.pendingRecoveryDisplays.isEmpty && persisted.pendingDisableDisplays.isEmpty, "successful single recovery retained settled evidence")
         }
 
-        runner.run("fresh root stays Automation-off without hidden rules or startup work") {
+        runner.run("fresh root stays Automation-off without startup work and seeds the default rules") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("display-steward-fresh-profile-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: root) }
             let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
@@ -1307,15 +1307,26 @@ private enum Phase2Tests {
                 scheduler: clock
             )
 
+            try equal(coordinator.status.configurationLoadSource, .createdBlankProfile, "fresh creation source was hidden")
+
             coordinator.start()
 
-            try equal(coordinator.status.configurationLoadSource, .createdBlankProfile, "fresh creation source was hidden")
             try expect(coordinator.status.activeProfile != nil, "fresh root did not expose its Active Profile")
+            try equal(coordinator.status.configurationLoadSource, .primary, "seeding did not repair the fresh Profile source")
             try expect(!coordinator.status.configuration.automatic.isEnabled, "fresh root enabled Automation")
-            try expect(coordinator.status.configuration.rules.isEmpty, "fresh root synthesized hidden Rules")
+            try expect(!coordinator.status.configuration.automatic.isEnabled, "fresh root enabled Automation")
+            try equal(
+                coordinator.status.configuration.rules,
+                LegacyConfigurationMigrator.defaultExternalRules(target: .exact(builtIn)),
+                "fresh root did not seed the default external-display rules"
+            )
+            try equal(coordinator.status.configuration.rules.map(\.name), ["检测到外接显示器", "未检测到外接显示器"], "default rule names changed")
+            try equal(coordinator.status.configuration.rules.map { $0.actions.first?.action }, [.disable, .enable], "default rule actions changed")
+            try equal(coordinator.status.configuration.rules.map { $0.conditions }, [[.count(DisplayCountCondition(kind: .online, scope: .external, comparison: .greaterThan, value: 0))], [.count(DisplayCountCondition(kind: .online, scope: .external, comparison: .equal, value: 0))]], "default rule conditions changed")
             try expect(clock.tasks.filter { !$0.cancelled }.isEmpty, "Automation-off startup scheduled hidden work")
             let freshPersisted = try store.load().activeProfile
-            try expect(freshPersisted.rules.isEmpty, "fresh observation persisted hidden Rules")
+            try equal(freshPersisted.rules, coordinator.status.configuration.rules, "fresh observation did not persist the seeded rules")
+            try expect(!freshPersisted.automatic.isEnabled, "fresh default enabled Automation after seeding")
         }
 
         runner.run("Active Profile persists across coordinator restart with generation status") {
