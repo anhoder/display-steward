@@ -90,6 +90,24 @@ Settings 会分别标记“正在编辑”和“当前激活”的 Profile。单
 
 配置损坏时，应用只会尝试同一设置或 Profile 的最后有效代次，不会自动选择其他 Profile，也不会静默覆盖损坏文件。
 
+## 故障排查
+
+### 日志文件
+
+- **主日志**：`~/Library/Logs/com.anhoder.display-steward.log`。应用以 ISO 8601 时间戳逐行追加，带类别前缀：`[AUTO]`（拓扑观察、规则求值、事务与后置检查）、`[HOTKEY]`（快捷键注册与使用）、`[RULES]`（规则播种与错误）。
+- **LaunchAgent 标准错误**：`~/Library/Logs/com.anhoder.display-steward.error.log`。
+- **配置与恢复证据**：`~/.config/display-steward/`（`config.json`、`config.last-good.json`、`runtime-state.json`）。
+- **单实例锁**：`~/Library/Application Support/Display Steward/instance.lock`。
+
+### 常见问题
+
+| 症状 | 排查 |
+| --- | --- |
+| 菜单栏没有应用图标 | `launchctl print "gui/$(id -u)/com.anhoder.display-steward"`；用 `./install.sh` 重装 |
+| 全局快捷键无效 | 查看日志 `[HOTKEY]` 行；可能被其他应用占用，在设置中更换 |
+| 自动化行为与预期不符 | `[AUTO] evaluation` 行显示匹配规则、胜出动作、冲突与最后活动屏安全拦截 |
+| 升级后显示行为异常 | 用 `./install.sh` 重新构建安装；可先 `./install.sh --smoke-test` 无副作用验证产物 |
+
 ## 开发与验证
 
 运行完整测试：

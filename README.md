@@ -90,6 +90,24 @@ Default configuration root:
 
 If configuration is corrupt, the app only falls back to the last-good generation of the same settings or profile. It never silently selects another profile and never silently overwrites a corrupt file.
 
+## Troubleshooting
+
+### Log files
+
+- **Main log**: `~/Library/Logs/com.anhoder.display-steward.log`. The app appends ISO 8601-timestamped lines with category prefixes: `[AUTO]` (topology observations, rule evaluations, transactions, postconditions), `[HOTKEY]` (shortcut registration and use), `[RULES]` (rule seeding and errors).
+- **LaunchAgent stderr**: `~/Library/Logs/com.anhoder.display-steward.error.log`.
+- **Configuration and recovery evidence**: `~/.config/display-steward/` (`config.json`, `config.last-good.json`, `runtime-state.json`).
+- **Single-instance lock**: `~/Library/Application Support/Display Steward/instance.lock`.
+
+### Common issues
+
+| Symptom | Check |
+| --- | --- |
+| App missing from the menu bar | `launchctl print "gui/$(id -u)/com.anhoder.display-steward"`; reinstall with `./install.sh` |
+| Global hotkey not working | `[HOTKEY]` lines in the log; another app may hold the shortcut — change it in Settings |
+| Automation not behaving as expected | `[AUTO] evaluation` lines show matched rules, winning actions, conflicts, and last-active-display safety blocks |
+| Display behavior wrong after an upgrade | Rebuild and reinstall with `./install.sh`; run `./install.sh --smoke-test` first to verify artifacts without side effects |
+
 ## Development and Verification
 
 Run the full test suite:

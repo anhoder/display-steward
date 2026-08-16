@@ -11,13 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - English README as the default document; Chinese README moved to `README.cn.md`.
 - MIT license.
-- CI workflow running all test phases and the install smoke test on macOS.
+- CI workflow running all test phases and the install smoke test on macOS, building the app on every push, and publishing a GitHub Release with the packaged app for every `v*` tag.
 - Security policy and code of conduct.
+- GitHub issue and pull request templates.
 
 ### Changed
 
 - LaunchAgent plist is now a machine-independent template rendered by `install.sh`;
   hardcoded user paths were removed.
+
+### Fixed
+
+- Automation now re-enables an app-disabled built-in display after the external
+  display is unplugged even when no screen-change notification arrives: the app
+  registers the CoreGraphics reconfiguration callback (previously it relied only
+  on the AppKit `didChangeScreenParametersNotification`, which macOS misses for
+  some unplug transitions), and a safety guard re-observes the topology every few
+  seconds while automation holds a display disabled.
 
 ## [1.0.0] - 2026-08-16
 

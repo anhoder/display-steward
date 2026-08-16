@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/anhoder/display-steward/blob/master/SECURITY.md
+    about: Report security issues privately — see SECURITY.md
