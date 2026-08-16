@@ -25,8 +25,11 @@ jobs:
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
+          # A plain directory path makes v4 upload the bundle's contents and
+          # strips the "Display Steward.app" wrapper; the wildcard preserves
+          # the matched directory name at the artifact root.
           name: Display-Steward-app
-          path: build/Display Steward.app
+          path: build/*.app
           if-no-files-found: error
 
   release:
@@ -46,6 +49,11 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           APP="staging/Display Steward.app"
+          test -d "$APP/Contents" || {
+            echo "Expected app bundle at '$APP'; downloaded artifact tree:"
+            find staging -maxdepth 3
+            exit 1
+          }
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
           codesign --force --deep --sign - "$APP"
