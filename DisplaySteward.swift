@@ -28,6 +28,57 @@ private let defaultHotKey = KeyShortcut(
     modifiers: HotKeyConfiguration.default.modifiers
 )
 
+/// Reliable CoreGraphics-level display-change signal. The AppKit
+/// didChangeScreenParametersNotification is not posted for every topology
+/// change (empirically missed external-display unplugs while the built-in was
+/// closed), so the coordinator must also hear reconfiguration callbacks.
+/// CGDisplayRegisterReconfigurationCallback is public API but absent from the
+/// Swift CoreGraphics overlay, so it is resolved dynamically like the
+/// adapter's private SPI.
+private typealias DisplayReconfigurationCallback = @convention(c) (
+    CGDirectDisplayID,
+    UInt32,
+    UnsafeMutableRawPointer?
+) -> Void
+private typealias RegisterDisplayReconfigurationFunction = @convention(c) (
+    DisplayReconfigurationCallback?,
+    UnsafeMutableRawPointer?
+) -> Int32
+private typealias RemoveDisplayReconfigurationFunction = @convention(c) (
+    DisplayReconfigurationCallback?,
+    UnsafeMutableRawPointer?
+) -> Int32
+
+private struct DisplayReconfigurationBridge {
+    let register: RegisterDisplayReconfigurationFunction
+    let remove: RemoveDisplayReconfigurationFunction
+}
+
+private func loadDisplayReconfigurationBridge() -> DisplayReconfigurationBridge? {
+    guard let framework = dlopen(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+        RTLD_LAZY
+    ), let registerSymbol = dlsym(framework, "CGDisplayRegisterReconfigurationCallback"),
+       let removeSymbol = dlsym(framework, "CGDisplayRemoveReconfigurationCallback") else {
+        return nil
+    }
+    return DisplayReconfigurationBridge(
+        register: unsafeBitCast(registerSymbol, to: RegisterDisplayReconfigurationFunction.self),
+        remove: unsafeBitCast(removeSymbol, to: RemoveDisplayReconfigurationFunction.self)
+    )
+}
+
+private let displayReconfigurationBridge = loadDisplayReconfigurationBridge()
+/// kCGDisplayBeginConfigurationFlag == (1 << 0); the Swift overlay does not
+/// expose the summary-flags constants.
+private let displayReconfigurationBeginFlag: UInt32 = 1 << 0
+
+private let displayReconfigurationCallback: DisplayReconfigurationCallback = { _, flags, userInfo in
+    guard flags & displayReconfigurationBeginFlag == 0,
+          let userInfo else { return }
+    Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue().handleDisplayReconfiguration()
+}
+
 private enum DisplayStewardError: LocalizedError {
     case builtinDisplayNotFound
     case hotKeyReconciliationFailed(String)
@@ -279,6 +330,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             writeLog("[AUTO] system wake received")
             self?.controller.handleWake()
         }
+        if let bridge = displayReconfigurationBridge {
+            let reconfigurationStatus = bridge.register(
+                displayReconfigurationCallback,
+                Unmanaged.passUnretained(self).toOpaque()
+            )
+            if reconfigurationStatus != 0 {
+                writeLog("[AUTO] display reconfiguration callback registration failed: \(reconfigurationStatus)")
+            }
+        } else {
+            writeLog("[AUTO] display reconfiguration callback unavailable; relying on screen notifications and the safety guard")
+        }
         controller.start()
         severeNotifications.present(status: controller.status)
         writeLog("[AUTO] application started; automatic=\(controller.configuration.automatic.isEnabled)")
@@ -294,9 +356,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         controller?.stop()
+        if let bridge = displayReconfigurationBridge {
+            _ = bridge.remove(
+                displayReconfigurationCallback,
+                Unmanaged.passUnretained(self).toOpaque()
+            )
+        }
         unregisterGlobalHotKey()
         if let observer { NotificationCenter.default.removeObserver(observer) }
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+    }
+
+    fileprivate func handleDisplayReconfiguration() {
+        writeLog("[AUTO] display reconfiguration callback")
+        controller.handleDisplayEvent()
     }
 
     private func setAutomatic(_ enabled: Bool) {
