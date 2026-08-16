@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -14,3 +15,43 @@ jobs:
         run: ./test-all.sh
       - name: Build and install smoke test
         run: ./install.sh --smoke-test
+
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: ./build.sh
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Display-Steward-app
+          path: build/Display Steward.app
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download built app
+        uses: actions/download-artifact@v4
+        with:
+          name: Display-Steward-app
+          path: staging
+      - name: Set version from tag and re-sign
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="staging/Display Steward.app"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "Display-Steward-$VERSION.zip"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Display-Steward-*.zip
+          generate_release_notes: true
