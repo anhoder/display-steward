@@ -54,6 +54,10 @@ jobs:
             find staging -maxdepth 3
             exit 1
           }
+          # actions/upload-artifact does not preserve Unix file modes, so the
+          # downloaded binary arrives non-executable; restore it before signing
+          # and packaging.
+          chmod +x "$APP/Contents/MacOS/DisplaySteward"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
           codesign --force --deep --sign - "$APP"

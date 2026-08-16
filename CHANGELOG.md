@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all/external display-count rule conditions, so unplugging the physical
   external display now restores the app-disabled built-in display instead of
   leaving it disabled while only a virtual framebuffer remains.
+- Tagged-release assets are now executable again: `actions/upload-artifact`
+  does not preserve Unix file modes, so the release job restores the
+  executable bit on the app binary before signing and packaging.
 
 ## [1.0.0] - 2026-08-16
 
