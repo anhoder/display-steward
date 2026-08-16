@@ -17,7 +17,7 @@ Display Steward is a native macOS menu bar app that manages display enable/disab
 - **Last-active-display protection**: Prevents rules or manual actions from disabling the last usable display.
 - **Recoverable state**: Records disable and restore operations initiated by the app that have not yet been confirmed complete.
 - **Manual control**: The menu bar can enable, disable, or restore managed displays.
-- **Global hotkey**: Default `⌃⌥⇧D` toggles the built-in display; configurable in Settings.
+- **Global hotkey**: Default `⌃⌥⌘M` toggles the built-in display; configurable in Settings.
 
 Display Steward only manages display enable/disable state. It does not modify the main display, arrangement, resolution, refresh rate, scaling, HDR, or color configuration.
 
@@ -72,6 +72,34 @@ This mode only verifies the build, bundle, plist, and code signature. It does no
 5. You can also quickly activate a saved profile from the **Profiles** submenu in the menu bar.
 
 Settings marks the profiles currently being edited and currently active separately. Clicking the list only switches the editing target; it never changes display state. Unsaved changes go through a Save, Discard, or Cancel confirmation before switching, closing, quitting, or a menu bar action.
+
+## Common Usage Scenarios
+
+**Office / home switching (manual)**
+
+Create one profile per place — for example, an "Office" profile that disables a rarely used secondary display and a "Home" profile that enables it. Switch from the **Profiles** submenu in the menu bar. Profiles never auto-switch based on location or display topology; the choice stays with you.
+
+**Single-screen focus mode**
+
+Create a profile with a high-priority `always` rule that disables the external display (targeted by exact identity or display family). Activate it from the menu bar when you need to concentrate, and switch back afterwards. The built-in display is protected by last-active-display protection, so a rule can never leave you with no usable screen.
+
+**Toggle the built-in display with the hotkey**
+
+Default `⌃⌥⌘M` toggles the built-in display on and off. Use it to flip between a dual-screen desk setup and external-monitor-only mode without opening Settings. If another app occupies the shortcut, rebind it in Settings.
+
+**Automatic cleanup when monitors change**
+
+Count conditions watch the number of online/active external displays. Example: a rule that enables a specific projector display only when external active displays are 2 or more, and disables it when they drop below. Automation evaluates after the startup/wake stabilization delay and on the polling interval, so plugging or unplugging a cable settles the state by itself. Give such rules distinct priorities — equal-priority rules requesting conflicting actions are reported as conflicts instead of being applied.
+
+**Presentation / projector setup**
+
+A dedicated "Presentation" profile whose rules enable the projector by exact identity or family. When actions conflict, the highest-priority rule wins. Activation previews the latest topology and asks for confirmation before disabling displays, so you can review what will change before committing.
+
+**Recovery after an unexpected quit**
+
+If the app disables a display and quits or crashes before the operation settles, it keeps recovery evidence in `runtime-state.json`. On the next launch, use the menu bar restore action to bring managed displays back. Recovery, automation, and manual operations all honor the last-active-display safety constraint at every step.
+
+All scenarios only change display enable/disable state — arrangement, resolution, refresh rate, and color configuration are never touched.
 
 ## Configuration Files
 
