@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Settings text inputs now honor the standard macOS editing shortcuts
+  (Select All `⌘A`, Copy `⌘C`, Paste `⌘V`, Cut `⌘X`, Undo/Redo, Delete) by
+  installing the application's standard Edit menu. As a menu-bar accessory the
+  app previously had no main menu, so the AppKit key equivalents for those
+  actions were never dispatched to the field editor.
 - Automation now listens for display changes through the CoreGraphics
   reconfiguration callback in addition to the AppKit
   `didChangeScreenParametersNotification`, which macOS does not post for every

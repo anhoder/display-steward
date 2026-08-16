@@ -492,6 +492,64 @@ runner.run("settings window unifies summary, rules, and displays") {
     try equal(settings.activeDetail, nil, "settings summary did not return")
 }
 
+runner.run("standard edit shortcuts route to settings text fields") {
+    _ = NSApplication.shared
+    let runtime = FakeRuntime(displays: [display(1, builtInIdentity, builtIn: true, main: true, state: .active, name: "Built-in")])
+    let settings = SettingsWindowController(
+        runtime: runtime,
+        shortcutProvider: { KeyShortcut(keyCode: 46, modifiers: 0x1900) },
+        shortcutSetter: { _ in true },
+        shortcutResetter: { true },
+        onLastActiveSafetyBlock: {}
+    )
+    installStandardMainMenu()
+    guard let mainMenu = NSApp.mainMenu else { throw Failure(description: "main menu was not installed") }
+    let editMenus = mainMenu.items.compactMap(\.submenu).filter { $0.title == "编辑" }
+    try equal(editMenus.count, 1, "standard main menu does not contain exactly one Edit menu")
+    guard let editMenu = editMenus.first else { throw Failure(description: "Edit menu missing") }
+    func editItem(_ title: String, key: String, modifiers: NSEvent.ModifierFlags) throws -> NSMenuItem {
+        guard let match = editMenu.items.first(where: {
+            $0.title == title && $0.keyEquivalent == key && $0.keyEquivalentModifierMask == modifiers
+        }) else {
+            throw Failure(description: "missing edit item \(title) with key \(key)")
+        }
+        try expect(match.target == nil, "edit item \(title) must route to the first responder")
+        return match
+    }
+    _ = try editItem("撤销", key: "z", modifiers: [.command])
+    _ = try editItem("重做", key: "z", modifiers: [.command, .shift])
+    _ = try editItem("剪切", key: "x", modifiers: [.command])
+    _ = try editItem("拷贝", key: "c", modifiers: [.command])
+    _ = try editItem("粘贴", key: "v", modifiers: [.command])
+    _ = try editItem("全选", key: "a", modifiers: [.command])
+
+    guard let window = settings.window, let content = window.contentView else {
+        throw Failure(description: "settings window missing")
+    }
+    content.layoutSubtreeIfNeeded()
+    guard let nameField = allSubviews(of: content).compactMap({ $0 as? NSTextField }).first(where: {
+        $0.identifier?.rawValue == "profileNameField"
+    }) else {
+        throw Failure(description: "profile name field missing")
+    }
+    nameField.stringValue = "Display Steward"
+    try expect(window.makeFirstResponder(nameField), "profile name field did not accept first responder")
+    guard let editor = window.fieldEditor(true, for: nameField) as? NSTextView else {
+        throw Failure(description: "field editor missing")
+    }
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    editor.selectAll(nil)
+    editor.copy(nil)
+    try equal(pasteboard.string(forType: .string), "Display Steward", "copy did not reach the pasteboard")
+    editor.selectAll(nil)
+    editor.cut(nil)
+    try equal(pasteboard.string(forType: .string), "Display Steward", "cut did not replace the pasteboard")
+    try expect(editor.string.isEmpty, "cut left text in the field")
+    editor.paste(nil)
+    try equal(editor.string, "Display Steward", "paste did not restore the cut text")
+}
+
 runner.run("severe notifications deduplicate unchanged diagnostics") {
     let runtime = FakeRuntime(displays: [])
     runtime.current.diagnostics = [RuntimeDiagnostic(severity: .error, code: .configurationUnavailable, message: "same")]

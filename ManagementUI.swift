@@ -118,6 +118,40 @@ func runDisplayRecoveryFlow(runtime: DisplayManagingRuntime, in window: NSWindow
     }
 }
 
+func installStandardMainMenu() {
+    let mainMenu = NSMenu()
+
+    let appMenuItem = NSMenuItem()
+    mainMenu.addItem(appMenuItem)
+    let appMenu = NSMenu(title: displayStewardAppName)
+    appMenuItem.submenu = appMenu
+    let quitItem = NSMenuItem(
+        title: "退出 \(displayStewardAppName)",
+        action: #selector(NSApplication.terminate(_:)),
+        keyEquivalent: "q"
+    )
+    quitItem.target = NSApp
+    appMenu.addItem(quitItem)
+
+    let editMenuItem = NSMenuItem()
+    mainMenu.addItem(editMenuItem)
+    let editMenu = NSMenu(title: "编辑")
+    editMenuItem.submenu = editMenu
+    editMenu.addItem(NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z"))
+    let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+    redoItem.keyEquivalentModifierMask = NSEvent.ModifierFlags([.command, .shift])
+    editMenu.addItem(redoItem)
+    editMenu.addItem(.separator())
+    editMenu.addItem(NSMenuItem(title: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+    editMenu.addItem(NSMenuItem(title: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+    editMenu.addItem(NSMenuItem(title: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+    editMenu.addItem(NSMenuItem(title: "删除", action: #selector(NSText.delete(_:)), keyEquivalent: ""))
+    editMenu.addItem(.separator())
+    editMenu.addItem(NSMenuItem(title: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+
+    NSApp.mainMenu = mainMenu
+}
+
 private enum ProfileTableEntry {
     case profile(DisplayProfile)
     case invalid(InvalidDisplayProfile)

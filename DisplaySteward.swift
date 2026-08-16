@@ -304,6 +304,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.severeNotifications.presentManualLastActiveSafetyBlock()
             }
         )
+        installStandardMainMenu()
         setupStatusItem()
         registerGlobalHotKey()
         severeNotifications.requestAuthorization()
