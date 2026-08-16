@@ -23,7 +23,7 @@ jobs:
       - name: Build app
         run: ./build.sh
       - name: Upload app artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           # A plain directory path makes the uploader include the bundle's
           # contents and strips the "Display Steward.app" wrapper; the
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Download built app
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: Display-Steward-app
           path: staging
