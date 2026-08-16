@@ -22,12 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Automation now re-enables an app-disabled built-in display after the external
-  display is unplugged even when no screen-change notification arrives: the app
-  registers the CoreGraphics reconfiguration callback (previously it relied only
-  on the AppKit `didChangeScreenParametersNotification`, which macOS misses for
-  some unplug transitions), and a safety guard re-observes the topology every few
-  seconds while automation holds a display disabled.
+- Automation now listens for display changes through the CoreGraphics
+  reconfiguration callback in addition to the AppKit
+  `didChangeScreenParametersNotification`, which macOS does not post for every
+  topology transition (external-display unplugs while the built-in was closed
+  were missed, leaving the built-in disabled).
 
 ## [1.0.0] - 2026-08-16
 

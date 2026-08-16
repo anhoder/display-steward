@@ -465,63 +465,6 @@ private enum Phase2Tests {
             try expect(finalState.appDisabledDisplays.isEmpty, "confirmed automatic re-enable did not retire app-disabled evidence")
         }
 
-        runner.run("safety guard recovers a missed external disconnect without any display event") {
-            let present = makeRule(
-                "external present",
-                conditions: [.count(.init(kind: .online, scope: .external, comparison: .greaterThan, value: 0))],
-                actions: [.init(target: .exact(builtIn), action: .disable)]
-            )
-            let absent = makeRule(
-                "external absent",
-                conditions: [.count(.init(kind: .online, scope: .external, comparison: .equal, value: 0))],
-                actions: [.init(target: .exact(builtIn), action: .enable)]
-            )
-            var state = RuntimeState.empty(bootIdentifier: "boot")
-            state.appDisabledDisplays = [.init(runtimeID: 1, stableIdentity: builtIn, family: builtInFamily)]
-            let value = try fixture(
-                config([present, absent]),
-                [
-                    display(1, builtIn, builtInFamily, builtIn: true, state: .disabledByThisAppConnectionUnknown),
-                    display(2, external1, externalFamily, main: true)
-                ],
-                state: state
-            )
-            defer { try? FileManager.default.removeItem(at: value.root) }
-            value.coordinator.start(); value.clock.advance(0)
-            try equal(value.adapter.transactions.last?.first?.action, .disable, "external-present disable was not applied")
-            // The unplug produces no display event at all (missed notification);
-            // only the safety guard may notice it.
-            value.adapter.setState(nil, runtimeID: 2)
-            value.clock.advance(3)
-            try expect(
-                value.adapter.transactions.contains { $0.contains { $0.action == .enable && $0.display.runtimeID == 1 } },
-                "safety guard did not re-enable the built-in after the missed external disconnect"
-            )
-            let finalState = try value.stateStore.load().state
-            try expect(finalState.appDisabledDisplays.isEmpty, "safety-guard re-enable did not retire app-disabled evidence")
-
-            // A paused automation must not be revived by the guard.
-            var pausedState = RuntimeState.empty(bootIdentifier: "boot")
-            pausedState.appDisabledDisplays = [.init(runtimeID: 1, stableIdentity: builtIn, family: builtInFamily)]
-            let paused = try fixture(
-                config([present, absent]),
-                [
-                    display(1, builtIn, builtInFamily, builtIn: true, state: .disabledByThisAppConnectionUnknown),
-                    display(2, external1, externalFamily, main: true)
-                ],
-                state: pausedState
-            )
-            defer { try? FileManager.default.removeItem(at: paused.root) }
-            paused.coordinator.start(); paused.clock.advance(0)
-            paused.coordinator.pause()
-            paused.adapter.setState(nil, runtimeID: 2)
-            paused.clock.advance(6)
-            try expect(
-                paused.adapter.transactions.allSatisfy { $0.allSatisfy { $0.action != .enable } },
-                "safety guard acted while automation was paused"
-            )
-        }
-
         runner.run("manual pause topology resume master off and save-apply semantics") {
             let noAction = config([makeRule("none", actions: [.init(target: .exact(builtIn), action: .noAction)])])
             let value = try fixture(noAction, [display(1, builtIn, builtInFamily, builtIn: true, main: true), display(2, external1, externalFamily)])

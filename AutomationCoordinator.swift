@@ -253,7 +253,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
     private let debounceSeconds: TimeInterval
     private let maximumActionAttempts: Int
     private let suppressionSeconds: TimeInterval
-    private let guardIntervalSeconds: TimeInterval
     private var liveApplicationSettingsActiveProfileID: UUID?
     private let log: (String) -> Void
     private let lock = NSRecursiveLock()
@@ -269,7 +268,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
     private var currentStatus: AutomationRuntimeStatus
     private var pendingEvaluation: AutomationScheduledTask?
     private var pollingTask: AutomationScheduledTask?
-    private var safetyGuardTask: AutomationScheduledTask?
     private var generation = 0
     private var manualTopologyBaseline: Set<String>?
     private var manualRecoverySelfTopologyChanges: Set<String>?
@@ -291,7 +289,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         debounceSeconds: TimeInterval = 1.5,
         maximumActionAttempts: Int = 3,
         suppressionSeconds: TimeInterval = 60,
-        guardIntervalSeconds: TimeInterval = 3,
         log: @escaping (String) -> Void = { _ in }
     ) throws {
         self.configurationStore = configurationStore
@@ -303,7 +300,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         self.debounceSeconds = max(0, debounceSeconds)
         self.maximumActionAttempts = max(1, maximumActionAttempts)
         self.suppressionSeconds = max(1, suppressionSeconds)
-        self.guardIntervalSeconds = max(1, guardIntervalSeconds)
         self.log = log
 
         var diagnostics: [RuntimeDiagnostic] = []
@@ -435,7 +431,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
                 scheduleEvaluation(after: configuration.automatic.startupStabilizationSeconds, trigger: "startup")
             }
             restartPolling()
-            restartSafetyGuard()
             publishStatus()
         } catch {
             recordRuntimeError(.runtimeStateUnavailable, "Startup inventory failed: \(error.localizedDescription)")
@@ -450,8 +445,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         pendingEvaluation = nil
         pollingTask?.cancel()
         pollingTask = nil
-        safetyGuardTask?.cancel()
-        safetyGuardTask = nil
     }
 
     func handleWake() {
@@ -688,7 +681,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         )
         currentStatus.lastProfileActivation = result
         restartPolling()
-        restartSafetyGuard()
         publishStatus()
         return result
     }
@@ -890,7 +882,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         currentStatus.configuration = candidate
         refreshCatalogStatus()
         restartPolling()
-        restartSafetyGuard()
 
         if applyImmediately {
             currentStatus.pauseReason = nil
@@ -1259,8 +1250,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         currentStatus.pauseReason = .explicit
         manualTopologyBaseline = nil
         manualRecoverySelfTopologyChanges = nil
-        safetyGuardTask?.cancel()
-        safetyGuardTask = nil
         currentStatus.diagnostics = baseDiagnostics + [RuntimeDiagnostic(
             severity: .info,
             code: .automationPaused,
@@ -1287,7 +1276,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         } catch {
             recordRuntimeError(.actionFailed, "Resume evaluation failed: \(error.localizedDescription)")
         }
-        restartSafetyGuard()
     }
 
     @discardableResult
@@ -1344,39 +1332,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         }
     }
 
-    /// Re-observes the topology while automation is running, unpaused, and the app
-    /// holds a display disabled, so a missed screen event (unplug while the built-in
-    /// is closed) still re-enables it. The repeating tick terminates itself once no
-    /// recovery evidence remains, automation stops, or the app pauses.
-    private func restartSafetyGuard() {
-        safetyGuardTask?.cancel()
-        safetyGuardTask = nil
-        guard configuration.automatic.isEnabled, currentStatus.pauseReason == nil else { return }
-        guard hasRecoveryEvidence else { return }
-        safetyGuardTask = scheduler.schedule(after: guardIntervalSeconds, repeating: guardIntervalSeconds) { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            defer { self.lock.unlock() }
-            guard self.configuration.automatic.isEnabled, self.currentStatus.pauseReason == nil else {
-                self.safetyGuardTask?.cancel()
-                self.safetyGuardTask = nil
-                return
-            }
-            guard self.hasRecoveryEvidence else {
-                self.safetyGuardTask?.cancel()
-                self.safetyGuardTask = nil
-                return
-            }
-            self.handleObservedTrigger(trigger: "safety-guard", delay: 0)
-        }
-    }
-
-    private var hasRecoveryEvidence: Bool {
-        !runtimeState.appDisabledDisplays.isEmpty
-            || !runtimeState.pendingDisableDisplays.isEmpty
-            || !runtimeState.pendingRecoveryDisplays.isEmpty
-    }
-
     private func handleObservedTrigger(trigger: String, delay: TimeInterval) {
         do {
             let snapshot = try observeAndNormalize()
@@ -1413,7 +1368,6 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         currentStatus.pauseReason = nil
         manualTopologyBaseline = nil
         manualRecoverySelfTopologyChanges = nil
-        restartSafetyGuard()
         log("[AUTO] manual pause ended after an actual online identity topology change")
     }
 
@@ -1496,16 +1450,9 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         let plan = evaluator.evaluate(configuration: evaluationConfiguration, snapshot: snapshot)
         currentStatus.configuration = configuration
         currentStatus.inventory = snapshot
-        let previousEvaluation = currentStatus.lastEvaluation
         currentStatus.lastEvaluation = plan
-        // The safety guard re-observes every few seconds while a display stays
-        // disabled; an unchanged plan is a no-op and must not spam the log or
-        // overwrite the last meaningful trigger shown in the UI.
-        let quietGuardEvaluation = trigger == "safety-guard" && plan == previousEvaluation
-        if !quietGuardEvaluation {
-            currentStatus.lastTrigger = trigger
-            logEvaluation(trigger: trigger, snapshot: snapshot, plan: plan)
-        }
+        currentStatus.lastTrigger = trigger
+        logEvaluation(trigger: trigger, snapshot: snapshot, plan: plan)
 
         guard applyActions,
               (forceActions || configuration.automatic.isEnabled),
@@ -1549,8 +1496,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             boundFingerprint: boundFingerprint,
             reconcileRecoveryEvidence: reconcileRecoveryEvidence,
             forceActions: forceActions,
-            allowedActionIntents: allowedActionIntents,
-            quietIdempotentLogs: trigger == "safety-guard"
+            allowedActionIntents: allowedActionIntents
         )
         diagnostics.append(contentsOf: report.diagnostics)
         currentStatus.diagnostics = diagnostics
@@ -1579,8 +1525,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         boundFingerprint: DisplayPolicySnapshotFingerprint,
         reconcileRecoveryEvidence: Bool,
         forceActions: Bool,
-        allowedActionIntents: Set<ConfirmedActionIntent>?,
-        quietIdempotentLogs: Bool = false
+        allowedActionIntents: Set<ConfirmedActionIntent>?
     ) throws -> HardwareApplicationReport {
         var finalFailures: [DisplayActionResult] = []
         var diagnostics: [RuntimeDiagnostic] = []
@@ -1683,15 +1628,11 @@ final class AutomationCoordinator: DisplayManagingRuntime {
                     transactionWasCommitted: committedUnknown
                 )
             }
-            let idempotentNoop = !outcome.transactionWasCommitted
-                && !outcome.results.contains { !$0.wasIdempotent || !$0.succeeded }
-            if !(quietIdempotentLogs && idempotentNoop) {
-                logTransactionOutcome(
-                    attempt: attempt,
-                    outcome: outcome,
-                    afterWasObserved: afterWasObserved
-                )
-            }
+            logTransactionOutcome(
+                attempt: attempt,
+                outcome: outcome,
+                afterWasObserved: afterWasObserved
+            )
             if outcome.requiresReevaluation {
                 try clearPendingForKnownUncommittedFailures(outcome)
                 if attempt == maximumActionAttempts { stalePlanExhausted = true }
@@ -1832,10 +1773,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
                 changed = true
             }
         }
-        if changed {
-            try persistRuntimeState()
-            restartSafetyGuard()
-        }
+        if changed { try persistRuntimeState() }
     }
 
     private func observeAndNormalize() throws -> ObservedDisplaySnapshot {
