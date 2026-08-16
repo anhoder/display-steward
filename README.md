@@ -123,7 +123,7 @@ Before committing changes, it is recommended to run:
 ./install.sh --smoke-test
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for further development constraints. Domain language and architecture decisions are recorded in [CONTEXT.md](CONTEXT.md), [SOUL.md](SOUL.md), and [`docs/adr/`](docs/adr/).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for further development constraints. Domain language and architecture decisions are recorded in [CONTEXT.md](CONTEXT.md), [SOUL.md](SOUL.md), and [`docs/adr/`](docs/adr/). Release history lives in [CHANGELOG.md](CHANGELOG.md); see [SECURITY.md](SECURITY.md) for the security policy.
 
 ## Main Modules
 

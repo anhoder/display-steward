@@ -11,12 +11,20 @@ CONFIG_PATH="$HOME/.config/display-steward"
 LEGACY_CONFIG_PATH="$HOME/.config/screen-manager"
 
 MODE=${1:-install}
+
+# Render the LaunchAgent template with the checkout and log paths of this
+# machine. The committed plist only carries __ROOT_DIR__/__LOG_DIR__ markers
+# so the repository stays machine-independent.
+render_plist() {
+    sed -e "s|__ROOT_DIR__|$ROOT_DIR|g" -e "s|__LOG_DIR__|$HOME/Library/Logs|g" "$PLIST_PATH"
+}
+
 if test "$MODE" = "--smoke-test"; then
     "$ROOT_DIR/build.sh"
     STAGING_DIR=$(mktemp -d "${TMPDIR:-/tmp}/display-steward-install.XXXXXX")
     trap 'rm -rf "$STAGING_DIR"' EXIT INT TERM
     STAGED_PLIST="$STAGING_DIR/$LABEL.plist"
-    cp "$PLIST_PATH" "$STAGED_PLIST"
+    render_plist > "$STAGED_PLIST"
     plutil -lint "$ROOT_DIR/Info.plist" "$PLIST_PATH" "$STAGED_PLIST" "$ROOT_DIR/build/Display Steward.app/Contents/Info.plist"
     test "$(plutil -extract Label raw -o - "$STAGED_PLIST")" = "$LABEL"
     test "$(plutil -extract ProgramArguments.0 raw -o - "$STAGED_PLIST")" = "$ROOT_DIR/build/Display Steward.app/Contents/MacOS/DisplaySteward"
@@ -44,7 +52,7 @@ if test -d "$LEGACY_CONFIG_PATH" && ! test -e "$CONFIG_PATH"; then
     mv "$LEGACY_CONFIG_PATH" "$CONFIG_PATH"
 fi
 
-cp "$PLIST_PATH" "$INSTALL_PATH"
+render_plist > "$INSTALL_PATH"
 plutil -lint "$INSTALL_PATH"
 rm -f "$LEGACY_INSTALL_PATH"
 launchctl bootstrap "gui/$uid" "$INSTALL_PATH"

@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run all test phases
+        run: ./test-all.sh
+      - name: Build and install smoke test
+        run: ./install.sh --smoke-test

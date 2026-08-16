@@ -6,7 +6,7 @@
     <string>com.anhoder.display-steward</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/anhoder/Desktop/display-steward/build/Display Steward.app/Contents/MacOS/DisplaySteward</string>
+        <string>__ROOT_DIR__/build/Display Steward.app/Contents/MacOS/DisplaySteward</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -20,8 +20,8 @@
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>/Users/anhoder/Library/Logs/com.anhoder.display-steward.log</string>
+    <string>__LOG_DIR__/com.anhoder.display-steward.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/anhoder/Library/Logs/com.anhoder.display-steward.error.log</string>
+    <string>__LOG_DIR__/com.anhoder.display-steward.error.log</string>
 </dict>
 </plist>

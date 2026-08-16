@@ -123,7 +123,7 @@ Settings 会分别标记“正在编辑”和“当前激活”的 Profile。单
 ./install.sh --smoke-test
 ```
 
-更多开发约束见 [CONTRIBUTING.md](CONTRIBUTING.md)。领域语言和架构决策分别记录在 [CONTEXT.md](CONTEXT.md)、[SOUL.md](SOUL.md) 和 [`docs/adr/`](docs/adr/)。
+更多开发约束见 [CONTRIBUTING.md](CONTRIBUTING.md)。领域语言和架构决策分别记录在 [CONTEXT.md](CONTEXT.md)、[SOUL.md](SOUL.md) 和 [`docs/adr/`](docs/adr/)。版本历史见 [CHANGELOG.md](CHANGELOG.md);安全策略见 [SECURITY.md](SECURITY.md)。
 
 ## 主要模块
 
