@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run all test phases
         run: ./test-all.sh
       - name: Build and install smoke test
@@ -19,15 +19,15 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build app
         run: ./build.sh
       - name: Upload app artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          # A plain directory path makes v4 upload the bundle's contents and
-          # strips the "Display Steward.app" wrapper; the wildcard preserves
-          # the matched directory name at the artifact root.
+          # A plain directory path makes the uploader include the bundle's
+          # contents and strips the "Display Steward.app" wrapper; the
+          # wildcard preserves the matched directory name at the artifact root.
           name: Display-Steward-app
           path: build/*.app
           if-no-files-found: error
@@ -39,9 +39,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Download built app
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: Display-Steward-app
           path: staging
@@ -59,7 +59,7 @@ jobs:
           codesign --force --deep --sign - "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "Display-Steward-$VERSION.zip"
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: Display-Steward-*.zip
           generate_release_notes: true
