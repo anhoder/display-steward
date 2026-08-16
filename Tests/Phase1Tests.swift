@@ -259,6 +259,26 @@ private enum Phase1TestMain {
             try expectEqual(identityPlan.safetyBlocks[0].display?.stableIdentity, externalIdentity1, "lowest stable identity should be retained")
         }
 
+        runner.run("virtual displays never satisfy all or external counts") {
+            let snapshot = ObservedDisplaySnapshot(displays: [
+                display(1, identity: builtInIdentity, family: builtInFamily, builtIn: true, main: true),
+                display(9, identity: nil, family: .virtualDisplay, state: .active)
+            ])
+            let plan = RuleEvaluator().evaluate(
+                configuration: configuration([
+                    rule(id("0000E0000001"), conditions: [.count(.init(kind: .online, scope: .external, comparison: .equal, value: 0))]),
+                    rule(id("0000E0000002"), conditions: [.count(.init(kind: .online, scope: .all, comparison: .equal, value: 1))]),
+                    rule(id("0000E0000003"), conditions: [.count(.init(kind: .active, scope: .external, comparison: .equal, value: 1))])
+                ]),
+                snapshot: snapshot
+            )
+            try expectEqual(
+                plan.matchedRuleIDs,
+                [id("0000E0000001"), id("0000E0000002")],
+                "virtual display leaked into all/external counts"
+            )
+        }
+
         runner.run("sleep state defers every automatic action") {
             let plan = RuleEvaluator().evaluate(
                 configuration: configuration([

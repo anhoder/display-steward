@@ -307,7 +307,7 @@ struct RuleEvaluator {
             return true
         case .count(let condition):
             let scoped = snapshot.displays.filter {
-                condition.scope == .all || !$0.isBuiltIn
+                !$0.family.isVirtual && (condition.scope == .all || !$0.isBuiltIn)
             }
             let count: Int
             switch condition.kind {

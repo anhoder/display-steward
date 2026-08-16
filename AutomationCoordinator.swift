@@ -1336,6 +1336,7 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         do {
             let snapshot = try observeAndNormalize()
             currentStatus.inventory = snapshot
+            logInventory(trigger: trigger, snapshot: snapshot)
             resumeManualPauseIfTopologyChanged(snapshot)
             if configuration.automatic.isEnabled {
                 scheduleEvaluation(after: delay, trigger: trigger)
@@ -1343,6 +1344,39 @@ final class AutomationCoordinator: DisplayManagingRuntime {
             publishStatus()
         } catch {
             recordRuntimeError(.runtimeStateUnavailable, "\(trigger) inventory failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Full per-display inventory printed on every change trigger (display
+    /// reconfiguration callback, screen-parameter notification, and poll), so
+    /// a topology transition that leaves a display disabled is visible in the
+    /// log: online/active counts plus each display's runtime ID, name,
+    /// built-in/main flags, state (including `.disabledByThisAppConnectionUnknown`
+    /// recovery records), family, serial, mirror target, and mode.
+    private func logInventory(trigger: String, snapshot: ObservedDisplaySnapshot) {
+        log(
+            "[AUTO] inventory trigger=\(trigger) online=\(snapshot.onlineCount) "
+                + "active=\(snapshot.activeCount) total=\(snapshot.displays.count)"
+        )
+        for display in snapshot.displays {
+            let runtimeID = display.runtimeID.map { String($0) } ?? "-"
+            let name = display.name.map { "\"\($0)\"" } ?? "-"
+            let family = String(format: "0x%04X/0x%04X", display.family.vendorID, display.family.modelID)
+            let serial = display.stableIdentity.map { String(format: "0x%08X", $0.serialNumber) } ?? "-"
+            let mirrors = display.mirrorsRuntimeID.map { String($0) } ?? "-"
+            let mode = display.mode.map {
+                let scale = $0.scaleFactor.map { String(format: "%.1f", $0) } ?? "?"
+                return String(
+                    format: "%dx%d@%.1fHz scale=%@ rotation=%.1f",
+                    $0.logicalWidth, $0.logicalHeight, $0.refreshRate,
+                    scale, $0.rotationDegrees
+                )
+            } ?? "-"
+            log(
+                "[AUTO] display runtimeID=\(runtimeID) name=\(name) builtIn=\(display.isBuiltIn) "
+                    + "main=\(display.isMain) state=\(display.state.rawValue) family=\(family) "
+                    + "serial=\(serial) mirrors=\(mirrors) mode=\(mode)"
+            )
         }
     }
 
@@ -2301,12 +2335,20 @@ final class AutomationCoordinator: DisplayManagingRuntime {
         snapshot: ObservedDisplaySnapshot,
         plan: RuleEvaluationPlan
     ) {
-        let matched = plan.matchedRuleIDs.map(\.uuidString).joined(separator: ",")
+        let ruleNames = Dictionary(uniqueKeysWithValues: configuration.rules.map { ($0.id, $0.name) })
+        let ruleName = { (id: UUID) -> String in
+            let name = ruleNames[id] ?? "?"
+            return "\(name)(\(id.uuidString))"
+        }
+        let attributedRuleIDs = { (ids: [UUID]) -> String in
+            ids.map(ruleName).joined(separator: "+")
+        }
+        let matched = plan.matchedRuleIDs.map(ruleName).joined(separator: ",")
         let winning = plan.winningActions.map {
-            "\($0.display.runtimeID):\($0.action.rawValue)"
+            "\($0.display.runtimeID):\($0.action.rawValue)@\(attributedRuleIDs($0.ruleIDs))"
         }.joined(separator: ",")
         let conflicts = plan.conflicts.map {
-            "\($0.display.runtimeID):\($0.actions.map(\.rawValue).joined(separator: "+"))"
+            "\($0.display.runtimeID):\($0.actions.map(\.rawValue).joined(separator: "+"))@\(attributedRuleIDs($0.ruleIDs))"
         }.joined(separator: ",")
         let safety = plan.safetyBlocks.map {
             "\($0.reason.rawValue):\($0.display.map { String($0.runtimeID) } ?? "none")"

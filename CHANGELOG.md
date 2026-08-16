@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Change detection now logs the full display inventory (runtime ID, name, built-in/main flags, state including app-disabled recovery records, vendor/model family, serial, mirror target, and mode) on every display-event and poll trigger, so topology transitions that leave a display disabled are diagnosable in the log. Automatic evaluation logs now include the matched rule names alongside their IDs and attribute every winning action and conflict to its source rule.
 - English README as the default document; Chinese README moved to `README.cn.md`.
 - MIT license.
 - CI workflow running all test phases and the install smoke test on macOS, building the app on every push, and publishing a GitHub Release with the packaged app for every `v*` tag.
@@ -27,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `didChangeScreenParametersNotification`, which macOS does not post for every
   topology transition (external-display unplugs while the built-in was closed
   were missed, leaving the built-in disabled).
+- Virtual displays (vendor `unkn`, model `virt` — the headless framebuffer
+  macOS keeps online when no physical display is available) are excluded from
+  all/external display-count rule conditions, so unplugging the physical
+  external display now restores the app-disabled built-in display instead of
+  leaving it disabled while only a virtual framebuffer remains.
 
 ## [1.0.0] - 2026-08-16
 

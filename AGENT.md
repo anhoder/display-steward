@@ -20,7 +20,7 @@ Display Steward is a native macOS menu-bar app for rule-driven, multi-display ma
 
 - Rules are named, enabled, ordered, and independently prioritized. Conditions inside one rule are AND; multiple rules provide OR.
 - Every matching rule contributes. The highest-priority explicit action wins per display; `noAction` has no opinion. Equal-priority enable/disable conflicts are reported, not guessed.
-- Conditions support online or active counts over all or external displays, exact-device state, vendor/model-family state, and always.
+- Conditions support online or active counts over all or external displays (the macOS headless virtual framebuffer — vendor `unkn`, model `virt` — is excluded from both count scopes), exact-device state, vendor/model-family state, and always.
 - Exact identity requires nonzero vendor, model, and serial values. Family identity uses vendor and model and intentionally applies to every current match.
 - Observable states are `online`, `active` (awake/drawable), app-disabled with physical connection unknown, and not currently observed. Never describe cached or historical records as physically connected or disconnected.
 - Enabling means making a display online. It must not implicitly alter mirroring, mode, layout, wake, brightness, or the main display.

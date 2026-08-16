@@ -427,6 +427,84 @@ private enum Phase4IntegrationTests {
             }
         }
 
+        runner.run("change detection logs the full display inventory") {
+            try withTemporaryDirectory { root in
+                try ConfigurationStore(rootURL: root, legacyDefaults: nil).save(stableConfiguration())
+                let adapter = IntegrationAdapter(displays: [
+                    display(runtimeID: 1, identity: builtInIdentity, builtIn: true, main: true, name: "Built-in"),
+                    display(runtimeID: 2, identity: externalIdentity, builtIn: false, name: "External")
+                ])
+                var logs: [String] = []
+                let runtime = try coordinator(root: root, adapter: adapter, log: { logs.append($0) })
+                runtime.start()
+                runtime.handleDisplayEvent()
+
+                guard let summary = logs.first(where: { $0.contains("[AUTO] inventory trigger=display-event") }) else {
+                    throw Failure(description: "change detection did not log an inventory summary")
+                }
+                try expect(summary.contains("online=2 active=2 total=2"), "inventory summary omitted snapshot counts")
+                guard let builtInLine = logs.first(where: { $0.contains("display") && $0.contains("runtimeID=1") }) else {
+                    throw Failure(description: "change detection omitted the built-in display line")
+                }
+                try expect(builtInLine.contains("name=\"Built-in\""), "display line omitted the display name")
+                try expect(builtInLine.contains("builtIn=true main=true state=active"), "display line omitted built-in/main/state")
+                try expect(builtInLine.contains("family=") && builtInLine.contains("serial="), "display line omitted family or serial")
+                try expect(builtInLine.contains("mirrors=-"), "display line omitted mirror target")
+                try expect(logs.contains { $0.contains("display") && $0.contains("runtimeID=2") && $0.contains("builtIn=false") && $0.contains("state=active") }, "change detection omitted the external display line")
+            }
+        }
+
+        runner.run("unplugging the physical external restores the built-in while a virtual display stays online") {
+            try withTemporaryDirectory { root in
+                var configuration = stableConfiguration(automatic: true)
+                configuration.rules = LegacyConfigurationMigrator.defaultExternalRules(target: .exact(builtInIdentity))
+                try ConfigurationStore(rootURL: root, legacyDefaults: nil).save(configuration)
+                let stateStore = RuntimeStateStore(rootURL: root, legacyDefaults: nil, bootIdentifierProvider: { "boot" })
+                var state = RuntimeState.empty(bootIdentifier: "boot")
+                state.appDisabledDisplays = [AppDisabledDisplayRecord(
+                    runtimeID: 1,
+                    stableIdentity: builtInIdentity,
+                    family: builtInFamily
+                )]
+                try stateStore.save(state)
+
+                let scheduler = TestScheduler()
+                let adapter = IntegrationAdapter(displays: [
+                    display(
+                        runtimeID: 1,
+                        identity: builtInIdentity,
+                        builtIn: true,
+                        main: false,
+                        state: .disabledByThisAppConnectionUnknown,
+                        name: "Built-in"
+                    ),
+                    ObservedDisplay(
+                        runtimeID: 9,
+                        stableIdentity: nil,
+                        family: .virtualDisplay,
+                        isBuiltIn: false,
+                        isMain: true,
+                        state: .active
+                    )
+                ])
+                var logs: [String] = []
+                let runtime = try coordinator(
+                    root: root,
+                    adapter: adapter,
+                    scheduler: scheduler,
+                    log: { logs.append($0) }
+                )
+                runtime.start()
+                scheduler.advance(0)
+
+                try equal(adapter.transactions.map { $0.map(\.action) }, [[.enable]], "a virtual display kept the built-in disabled instead of restoring it")
+                try expect(logs.contains { $0.contains("evaluation trigger=startup") && $0.contains("winning=[1:enable@未检测到外接显示器(") }, "evaluation log omitted the built-in enable and its source rule")
+                try expect(logs.contains { $0.contains("matched=[未检测到外接显示器(") }, "evaluation log omitted the matched rule name")
+                try equal(runtime.status.inventory.displays.first(where: { $0.runtimeID == 1 })?.state, .active, "built-in was not restored while only a virtual display remained online")
+                try equal(runtime.status.inventory.displays.first(where: { $0.runtimeID == 9 })?.state, .active, "virtual display vanished from the observed inventory")
+            }
+        }
+
         runner.run("corrupt generations fall back or disable automation without overwrite") {
             try withTemporaryDirectory { root in
                 let store = ConfigurationStore(rootURL: root, legacyDefaults: nil)
@@ -603,7 +681,7 @@ private enum Phase4IntegrationTests {
                 try equal(adapter.transactions.count, 1, "automatic rule used duplicate coordinator paths")
                 try equal(adapter.transactions.first?.map(\.action), [.disable], "automatic path applied an unexpected batch")
                 try expect(publications > 0, "coordinator did not publish status")
-                try expect(logs.contains { $0.contains("evaluation trigger=startup") && $0.contains("winning=[1:disable]") }, "automatic evaluation summary omitted winning action")
+                try expect(logs.contains { $0.contains("evaluation trigger=startup") && $0.contains("winning=[1:disable@检测到外接显示器(") }, "automatic evaluation summary omitted winning action and its source rule")
                 try expect(logs.contains { $0.contains("transaction attempt=1/1") && $0.contains("committed=true") && $0.contains("success=[1:disable]") && $0.contains("failure=[]") && $0.contains("afterActive=1") }, "transaction outcome summary omitted commit, result, or postcondition")
                 let status = runtime.status
                 try equal(status.inventory.displays.first(where: { $0.runtimeID == 1 })?.state, .disabledByThisAppConnectionUnknown, "status did not expose automatic result")

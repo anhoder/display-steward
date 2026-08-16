@@ -4,6 +4,15 @@ struct DisplayFamily: Codable, Hashable, Comparable {
     var vendorID: UInt32
     var modelID: UInt32
 
+    /// The headless/virtual framebuffer macOS keeps online when no physical
+    /// display is available (e.g. the built-in display is app-disabled and the
+    /// external display was unplugged). Vendor "unkn" (0x756E6B6E), model
+    /// "virt" (0x76697274). It is not a physical display and never satisfies
+    /// all/external display-count conditions.
+    static let virtualDisplay = DisplayFamily(vendorID: 0x756E6B6E, modelID: 0x76697274)
+
+    var isVirtual: Bool { self == .virtualDisplay }
+
     static func < (lhs: DisplayFamily, rhs: DisplayFamily) -> Bool {
         if lhs.vendorID != rhs.vendorID { return lhs.vendorID < rhs.vendorID }
         return lhs.modelID < rhs.modelID
