@@ -31,7 +31,7 @@ Display Steward is a native macOS menu-bar app for rule-driven, multi-display ma
 - The aggregate entry label intentionally uses the user-facing copy `恢复所有由本应用关闭的显示器…`; its confirmation and per-display states must use Recoverable Display terminology and explicitly distinguish closed, pending-confirmation, unresolved, and uncertain evidence.
 - Menu display commands are short-lived: refresh and re-resolve the row and expected hardware target before acting, then bind the coordinator request to that target.
 - The main window is a concise overview. The management window has Rules and Displays pages. The status menu has per-display submenus. There is no fixed built-in-only automatic policy or duplicate policy path.
-- The global hotkey remains a configurable built-in-display toggle, defaults to `⌃⌥⌘D`, and preserves the previous registration when a replacement fails.
+- The global hotkey remains a configurable built-in-display toggle, defaults to `⌃⌥⌘M`, and preserves the previous registration when a replacement fails.
 - Two explicit Chinese default rules reproduce the old external-present behavior only after a reliable built-in target is known. An intentionally empty saved rule list remains empty and performs no hidden action.
 
 ## Persistence and runtime files

@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardcoded user paths were removed.
 - CI publishes a universal (arm64 + x86_64) app and a DMG alongside the zip
   in tagged releases; local builds are universal too.
+- Default built-in-display global hotkey changed from `⌃⌥⇧D` to `⌃⌥⌘M`.
 
 ### Fixed
 

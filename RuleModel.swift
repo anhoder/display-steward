@@ -201,7 +201,7 @@ struct HotKeyConfiguration: Codable, Equatable {
     var keyCode: UInt32
     var modifiers: UInt32
 
-    static let `default` = HotKeyConfiguration(keyCode: 2, modifiers: 0x1A00)
+    static let `default` = HotKeyConfiguration(keyCode: 46, modifiers: 0x1900)
 }
 
 struct KnownDisplay: Codable, Equatable {

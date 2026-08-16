@@ -32,7 +32,7 @@ Retain at least one active usable display. Prefer the current main display on eq
 
 ### User control without stale overwrites
 
-The overview, menu, Profile editor, Rules page, Displays page, and configurable `⌃⌥⇧D` built-in toggle read the same current status. The status menu can activate a Profile quickly, but it must resolve dirty Profile drafts first, re-observe the display topology, preview the exact persisted Profile generation, and bind confirmation to that Profile and topology before applying any display action.
+The overview, menu, Profile editor, Rules page, Displays page, and configurable `⌃⌥⌘M` built-in toggle read the same current status. The status menu can activate a Profile quickly, but it must resolve dirty Profile drafts first, re-observe the display topology, preview the exact persisted Profile generation, and bind confirmation to that Profile and topology before applying any display action.
 
 Settings distinguishes the Profile being edited from the Active Profile. Name, Automation, polling, and Rules share one identity-bound draft; ordinary list navigation never activates it. Saving an inactive draft has no runtime effect, while Active Save and Apply and explicit activation use the coordinator. The global hotkey, display history, recovery evidence, and manual display controls remain application-wide.
 

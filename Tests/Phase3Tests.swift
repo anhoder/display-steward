@@ -454,7 +454,7 @@ runner.run("settings window unifies summary, rules, and displays") {
     let runtime = FakeRuntime(displays: [display(1, builtInIdentity, builtIn: true, main: true, state: .active, name: "Built-in")])
     let settings = SettingsWindowController(
         runtime: runtime,
-        shortcutProvider: { KeyShortcut(keyCode: 2, modifiers: 0x1A00) },
+        shortcutProvider: { KeyShortcut(keyCode: 46, modifiers: 0x1900) },
         shortcutSetter: { _ in true },
         shortcutResetter: { true },
         onLastActiveSafetyBlock: {}
@@ -771,7 +771,7 @@ runner.run("settings exposes aggregate and per-display recovery controls") {
     let runtime = FakeRuntime(displays: [display(1, builtInIdentity, builtIn: true, main: true, state: .active, name: "Built-in")])
     let settings = SettingsWindowController(
         runtime: runtime,
-        shortcutProvider: { KeyShortcut(keyCode: 2, modifiers: 0x1A00) },
+        shortcutProvider: { KeyShortcut(keyCode: 46, modifiers: 0x1900) },
         shortcutSetter: { _ in true },
         shortcutResetter: { true },
         onLastActiveSafetyBlock: {}
@@ -1093,7 +1093,7 @@ runner.run("Settings exposes Profile hierarchy identifiers and cancel guard") {
     let inactive = try runtime.createBlankProfile(named: "未激活")
     let settings = SettingsWindowController(
         runtime: runtime,
-        shortcutProvider: { KeyShortcut(keyCode: 2, modifiers: 0x1A00) },
+        shortcutProvider: { KeyShortcut(keyCode: 46, modifiers: 0x1900) },
         shortcutSetter: { _ in true },
         shortcutResetter: { true },
         onLastActiveSafetyBlock: {},
@@ -1126,7 +1126,7 @@ runner.run("Settings discard reacquires persisted Profile before delete confirma
     let inactive = try runtime.createBlankProfile(named: "持久化名称")
     let settings = SettingsWindowController(
         runtime: runtime,
-        shortcutProvider: { KeyShortcut(keyCode: 2, modifiers: 0x1A00) },
+        shortcutProvider: { KeyShortcut(keyCode: 46, modifiers: 0x1900) },
         shortcutSetter: { _ in true },
         shortcutResetter: { true },
         onLastActiveSafetyBlock: {},
@@ -1199,7 +1199,7 @@ runner.run("Settings visibly retains explicit application settings reload warnin
     var shortcutSetCount = 0
     let settings = SettingsWindowController(
         runtime: runtime,
-        shortcutProvider: { KeyShortcut(keyCode: 2, modifiers: 0x1A00) },
+        shortcutProvider: { KeyShortcut(keyCode: 46, modifiers: 0x1900) },
         shortcutSetter: { _ in shortcutSetCount += 1; return true },
         shortcutResetter: { true },
         onLastActiveSafetyBlock: {}
